@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\LegacyAuthFinder.Core\LegacyAuthFinder.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>legacy-auth-scan</AssemblyName>
+  </PropertyGroup>
+
+</Project>

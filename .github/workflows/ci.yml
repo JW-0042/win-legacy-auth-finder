@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet build LegacyAuthFinder.slnx -c Release
+      # The runner has admin rights, so the integration tests also read an exported Security log.
+      - run: dotnet test LegacyAuthFinder.slnx -c Release --no-build --logger "console;verbosity=normal"
+      - name: Scan the runner's own archived logs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory logs/dc | Out-Null
+          wevtutil epl Security logs/dc/Archive-Security-ci.evtx
+          wevtutil epl System logs/dc/Archive-System-ci.evtx
+          wevtutil epl Application logs/Archive-Application-ci.evtx
+          dotnet run --project src/LegacyAuthFinder.Cli -c Release --no-build -- logs --json scan.json
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
+          $r = Get-Content scan.json | ConvertFrom-Json
+          $r.files | Format-Table log, state, found, size
+          if (@($r.files | Where-Object state -eq 'Done').Count -ne 2) { throw "Security and System logs should both be scanned" }
+          if (@($r.files | Where-Object state -eq 'Skipped').Count -ne 1) { throw "The Application log should be skipped" }
+          exit 0
+      - name: Check the demo data
+        shell: pwsh
+        run: |
+          dotnet run --project src/LegacyAuthFinder.Cli -c Release --no-build -- --demo --json demo.json --quiet
+          if ($LASTEXITCODE -ne 1) { throw "Demo data should report findings" }
+          $r = Get-Content demo.json | ConvertFrom-Json
+          if ($r.totals.des -lt 1 -or $r.totals.ntlmv1 -lt 1 -or $r.totals.rc4 -lt 1) { throw "Demo should contain every type" }
+          exit 0

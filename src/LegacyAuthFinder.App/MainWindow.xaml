@@ -1,0 +1,239 @@
+<Window x:Class="LegacyAuthFinder.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:LegacyAuthFinder.App"
+        Title="Legacy Auth Finder" Width="1440" Height="860" MinWidth="1100" MinHeight="640"
+        WindowStartupLocation="CenterScreen" AllowDrop="True" Drop="Window_Drop">
+    <Window.DataContext>
+        <local:MainViewModel />
+    </Window.DataContext>
+
+    <Window.Resources>
+        <Style x:Key="Tile" TargetType="Border">
+            <Setter Property="CornerRadius" Value="8" />
+            <Setter Property="Padding" Value="10,6" />
+            <Setter Property="Margin" Value="0,0,6,6" />
+            <Setter Property="BorderThickness" Value="0,0,0,3" />
+            <Setter Property="Background" Value="{DynamicResource ControlFillColorSecondaryBrush}" />
+        </Style>
+        <Style x:Key="Grid" TargetType="DataGrid" BasedOn="{StaticResource {x:Type DataGrid}}">
+            <Setter Property="AutoGenerateColumns" Value="False" />
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="HeadersVisibility" Value="Column" />
+            <Setter Property="GridLinesVisibility" Value="None" />
+            <Setter Property="SelectionMode" Value="Single" />
+            <Setter Property="EnableRowVirtualization" Value="True" />
+            <Setter Property="EnableColumnVirtualization" Value="True" />
+            <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
+            <Setter Property="CanUserResizeRows" Value="False" />
+            <Setter Property="CellStyle">
+                <Setter.Value>
+                    <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                        <Setter Property="VerticalContentAlignment" Value="Center" />
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <DataTemplate x:Key="KindCell">
+            <Border CornerRadius="9" Padding="8,1" HorizontalAlignment="Left" VerticalAlignment="Center" Background="{Binding Kind, Converter={StaticResource KindBrush}}">
+                <TextBlock Text="{Binding KindLabel}" Foreground="White" FontSize="12" FontWeight="SemiBold" />
+            </Border>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="16">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="270" />
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="380" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Left: folder, progress, totals -->
+        <ScrollViewer Grid.Column="0" Margin="0,0,16,0" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <TextBlock Text="Legacy Auth Finder" FontSize="22" FontWeight="SemiBold" />
+                <TextBlock Text="NTLMv1, RC4 and DES in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,14" />
+
+                <Button Content="Open folder…" Click="OpenFolder_Click" IsEnabled="{Binding CanAct}"
+                        Style="{DynamicResource AccentButtonStyle}" HorizontalAlignment="Stretch" Padding="8,10" Margin="0,0,0,8" />
+                <TextBlock Text="{Binding Folder}" TextWrapping="Wrap" FontSize="12" Opacity="0.7" Margin="0,0,0,8"
+                           Visibility="{Binding HasFolder, Converter={StaticResource BoolToVis}}" />
+                <CheckBox Content="Include subfolders" IsChecked="{Binding Recurse}" IsEnabled="{Binding CanAct}" Margin="0,0,0,6" />
+                <Grid Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="80" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Files scanned at once" VerticalAlignment="Center" />
+                    <ComboBox Grid.Column="1" ItemsSource="{Binding ThreadChoices}" SelectedItem="{Binding Threads}" IsEnabled="{Binding CanAct}" />
+                </Grid>
+
+                <StackPanel Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}" Margin="0,0,0,12">
+                    <ProgressBar Value="{Binding OverallProgress, Mode=OneWay}" Maximum="100" Height="6" Margin="0,0,0,6" />
+                    <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" Margin="0,0,0,6" />
+                    <Button Content="Cancel" Click="Cancel_Click" HorizontalAlignment="Left" Padding="14,4" />
+                </StackPanel>
+
+                <Border CornerRadius="10" Padding="14" Margin="0,0,0,12"
+                        Background="{DynamicResource ControlFillColorDefaultBrush}"
+                        BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+                    <StackPanel>
+                        <TextBlock Text="{Binding HeadlineText}" TextWrapping="Wrap" FontWeight="SemiBold" Margin="0,0,0,10" />
+                        <UniformGrid Columns="3" Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
+                            <Border Style="{StaticResource Tile}" BorderBrush="#B0124F">
+                                <StackPanel><TextBlock Text="DES" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding DesCount}" FontSize="17" FontWeight="Bold" /></StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource Tile}" BorderBrush="#D93025">
+                                <StackPanel><TextBlock Text="NTLMv1" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding NtlmCount}" FontSize="17" FontWeight="Bold" /></StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource Tile}" BorderBrush="#C25E00">
+                                <StackPanel><TextBlock Text="RC4" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding Rc4Count}" FontSize="17" FontWeight="Bold" /></StackPanel>
+                            </Border>
+                        </UniformGrid>
+                        <TextBlock Text="{Binding TruncatedText}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" Margin="0,6,0,0"
+                                   Visibility="{Binding IsTruncated, Converter={StaticResource BoolToVis}}" />
+                    </StackPanel>
+                </Border>
+
+                <StackPanel Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
+                    <TextBlock Text="Export" FontWeight="SemiBold" Margin="0,0,0,6" />
+                    <Button Content="Summary as CSV" Click="ExportSummary_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
+                    <Button Content="All events as CSV" Click="ExportEvents_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
+                    <Button Content="HTML report" Click="ExportHtml_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
+                    <Button Content="JSON" Click="ExportJson_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,12" />
+                </StackPanel>
+
+                <Button Content="Try the demo data" Click="Demo_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,12" />
+
+                <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12"
+                           Text="Read-only: the tool only reads the files. Tip: you can also drop a folder onto this window." />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Middle: summary, events, files -->
+        <DockPanel Grid.Column="1" Margin="0,0,16,0">
+            <Grid DockPanel.Dock="Top" Margin="0,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="130" />
+                </Grid.ColumnDefinitions>
+                <TextBox Grid.Column="0" Text="{Binding Search, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,8,0"
+                         ToolTip="Search accounts, clients, services, servers and files. Several words must all match." />
+                <ComboBox Grid.Column="1" ItemsSource="{Binding KindFilters}" SelectedItem="{Binding KindFilter}" ToolTip="Type" />
+            </Grid>
+
+            <TabControl SelectedIndex="{Binding SelectedTab}">
+                <TabItem Header="{Binding SummaryHeader}">
+                    <DataGrid x:Name="SummaryGrid" Style="{StaticResource Grid}" ItemsSource="{Binding Summary}" SelectionChanged="Grid_SelectionChanged"
+                              MouseDoubleClick="SummaryGrid_DoubleClick">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="80" SortMemberPath="KindLabel" />
+                            <DataGridTextColumn Header="Account" Binding="{Binding Account}" Width="2*" />
+                            <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="*" />
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="2*" />
+                            <DataGridTextColumn Header="Events" Binding="{Binding Count, StringFormat=N0}" Width="80" />
+                            <DataGridTextColumn Header="Last seen" Binding="{Binding LastSeen, StringFormat=yyyy-MM-dd HH:mm}" Width="125" />
+                            <DataGridTextColumn Header="Logged on" Binding="{Binding ComputersText}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </TabItem>
+                <TabItem Header="{Binding EventsHeader}">
+                    <DataGrid x:Name="EventsGrid" Style="{StaticResource Grid}" ItemsSource="{Binding Events}" CanUserSortColumns="False"
+                              SelectionChanged="Grid_SelectionChanged">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Time" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="140" />
+                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="80" />
+                            <DataGridTextColumn Header="ID" Binding="{Binding EventId}" Width="50" />
+                            <DataGridTextColumn Header="Account" Binding="{Binding Account}" Width="2*" />
+                            <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="*" />
+                            <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="2*" />
+                            <DataGridTextColumn Header="Detail" Binding="{Binding Variant}" Width="*" />
+                            <DataGridTextColumn Header="Logged on" Binding="{Binding Computer}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </TabItem>
+                <TabItem Header="{Binding FilesHeader}">
+                    <DataGrid Style="{StaticResource Grid}" ItemsSource="{Binding Files}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="File" Binding="{Binding Name}" Width="2*" />
+                            <DataGridTextColumn Header="Log" Binding="{Binding Log}" Width="90" />
+                            <DataGridTextColumn Header="Computer" Binding="{Binding Computer}" Width="*" />
+                            <DataGridTextColumn Header="Size" Binding="{Binding SizeText}" Width="75" SortMemberPath="Size" />
+                            <DataGridTextColumn Header="Covers" Binding="{Binding RangeText}" Width="1.6*" />
+                            <DataGridTemplateColumn Header="Result" Width="1.8*" SortMemberPath="Hits">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <StackPanel VerticalAlignment="Center">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Ellipse Width="8" Height="8" Margin="0,0,6,0" Fill="{Binding State, Converter={StaticResource FileStateBrush}}" />
+                                                <TextBlock Text="{Binding Status}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Status}" />
+                                            </StackPanel>
+                                            <ProgressBar Value="{Binding Percent, Mode=OneWay}" Maximum="100" Height="3" Margin="0,3,0,0"
+                                                         Visibility="{Binding IsScanning, Converter={StaticResource BoolToVis}}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </TabItem>
+            </TabControl>
+        </DockPanel>
+
+        <!-- Right: detail and guidance -->
+        <Border Grid.Column="2" CornerRadius="10" Padding="18"
+                Background="{DynamicResource ControlFillColorDefaultBrush}"
+                BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
+            <Grid>
+                <TextBlock Text="Pick a row to see the details and what to do about it." Opacity="0.6" TextWrapping="Wrap"
+                           Visibility="{Binding HasSelection, Converter={StaticResource BoolToVisInverted}}" />
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Visibility="{Binding HasSelection, Converter={StaticResource BoolToVis}}">
+                    <StackPanel>
+                        <Border CornerRadius="10" Padding="10,2" HorizontalAlignment="Left" Margin="0,0,0,8"
+                                Background="{Binding DetailKind, Converter={StaticResource KindBrush}}">
+                            <TextBlock Text="{Binding Guide.Label}" Foreground="White" FontWeight="SemiBold" />
+                        </Border>
+                        <TextBlock Text="{Binding DetailTitle}" FontSize="19" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                        <ItemsControl ItemsSource="{Binding DetailRows}" Margin="0,0,0,8">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="130" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Label}" Opacity="0.65" TextTrimming="CharacterEllipsis" ToolTip="{Binding Label}" />
+                                        <TextBox Grid.Column="1" Text="{Binding Value, Mode=OneWay}" IsReadOnly="True" TextWrapping="Wrap"
+                                                 BorderThickness="0" Background="Transparent" Padding="0" MinHeight="0" FontFamily="Consolas" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                        <Button Content="Show these events" Click="ShowEvents_Click" HorizontalAlignment="Left" Padding="12,5" Margin="0,0,0,14"
+                                Visibility="{Binding CanShowEvents, Converter={StaticResource BoolToVis}}" />
+
+                        <TextBlock Text="What it is" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Guide.What}" TextWrapping="Wrap" Margin="0,4,0,12" />
+                        <TextBlock Text="Why it matters" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Guide.Risk}" TextWrapping="Wrap" Margin="0,4,0,12" />
+                        <TextBlock Text="What to do" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Guide.Fix}" TextWrapping="Wrap" Margin="0,4,0,12" />
+                        <TextBlock Text="References" FontWeight="SemiBold" />
+                        <ItemsControl ItemsSource="{Binding Guide.References}" Margin="0,4,0,0">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Margin="0,2" TextWrapping="Wrap">
+                                        <Hyperlink NavigateUri="{Binding Url}" RequestNavigate="Link_RequestNavigate">
+                                            <Run Text="{Binding Label, Mode=OneWay}" />
+                                        </Hyperlink>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </ScrollViewer>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

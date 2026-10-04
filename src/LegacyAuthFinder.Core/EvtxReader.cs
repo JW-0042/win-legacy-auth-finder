@@ -1,0 +1,160 @@
+using System.Diagnostics.Eventing.Reader;
+using System.Globalization;
+using System.Security.Principal;
+using System.Xml.Linq;
+
+namespace LegacyAuthFinder.Core;
+
+/// <summary>
+/// One filtered pass over a file. The XPath filter runs inside the Windows event log API, so a 4 GB file is
+/// streamed and only matching records reach .NET. Fields are pulled by name with a property selector, which is
+/// much faster than rendering XML. Fields null means the full EventData is read through XML (used for rare events).
+/// </summary>
+public sealed record EvtxQuery(string Name, string Channel, string XPath, IReadOnlyList<string>? Fields);
+
+public interface IEvtxReader
+{
+    LogFileInfo Inspect(string path);
+
+    IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken);
+}
+
+public static class Queries
+{
+    public static readonly IReadOnlyList<string> NtlmFields =
+    [
+        "TargetUserName", "TargetDomainName", "WorkstationName", "IpAddress", "IpPort", "LogonType",
+        "LmPackageName", "AuthenticationPackageName", "KeyLength", "LogonProcessName", "ProcessName", "Status", "SubStatus",
+    ];
+
+    public static readonly IReadOnlyList<string> KerberosFields =
+    [
+        "TargetUserName", "TargetDomainName", "ServiceName", "IpAddress", "IpPort", "TicketOptions", "Status", "PreAuthType",
+        "TicketEncryptionType", "SessionKeyEncryptionType", "ClientAdvertizedEncryptionTypes",
+        "AccountSupportedEncryptionTypes", "AccountAvailableKeys", "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
+        "DCSupportedEncryptionTypes", "DCAvailableKeys",
+    ];
+
+    private static readonly string[] WeakEtypes = ["0x17", "0x18", "0x1", "0x3"];
+
+    public static EvtxQuery Ntlmv1 { get; } = new("NTLMv1 logons", Channels.Security,
+        "*[System[(EventID=4624 or EventID=4625)] and EventData[Data[@Name='LmPackageName']='NTLM V1' or Data[@Name='LmPackageName']='LM']]",
+        NtlmFields);
+
+    public static EvtxQuery Kerberos { get; } = new("RC4 and DES Kerberos tickets", Channels.Security,
+        "*[System[(EventID=4768 or EventID=4769 or EventID=4770)] and EventData["
+        + string.Join(" or ", WeakEtypes.SelectMany(t => new[]
+        {
+            $"Data[@Name='TicketEncryptionType']='{t}'",
+            $"Data[@Name='SessionKeyEncryptionType']='{t}'",
+        }))
+        + "]]",
+        KerberosFields);
+
+    public static EvtxQuery KdcWarnings { get; } = new("KDC RC4 warnings", Channels.System,
+        $"*[System[(Provider[@Name='{Providers.KdcSvc}'] or Provider[@Name='{Providers.Kdc}']) and (EventID>=201 and EventID<=209)]]",
+        null);
+
+    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KdcWarnings];
+
+    public static IEnumerable<EvtxQuery> For(string channel) => All.Where(q => q.Channel == channel);
+}
+
+public sealed class WindowsEvtxReader : IEvtxReader
+{
+    private static readonly HashSet<string> HexFields = new(StringComparer.Ordinal)
+    {
+        "TicketEncryptionType", "SessionKeyEncryptionType", "TicketOptions", "Status", "SubStatus",
+    };
+
+    public LogFileInfo Inspect(string path)
+    {
+        var size = new FileInfo(path).Length;
+        try
+        {
+            var info = EventLogSession.GlobalSession.GetLogInformation(path, PathType.FilePath);
+            var (channel, computer, first) = Edge(path, reverse: false);
+            var (_, _, last) = Edge(path, reverse: true);
+            return new LogFileInfo(path, size, channel ?? "(empty)", computer ?? "", info.RecordCount ?? 0, info.OldestRecordNumber ?? 0, first, last);
+        }
+        catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException)
+        {
+            return new LogFileInfo(path, size, "", "", 0, 0, null, null, $"Cannot read this file. It may be damaged or not an event log file. ({ex.Message.Trim()})");
+        }
+    }
+
+    private static (string? Channel, string? Computer, DateTime? Time) Edge(string path, bool reverse)
+    {
+        using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, "*") { ReverseDirection = reverse });
+        using var record = reader.ReadEvent();
+        return record is null ? (null, null, null) : (record.LogName, record.MachineName, record.TimeCreated);
+    }
+
+    public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
+    {
+        using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, query.XPath));
+        using var selector = query.Fields is null
+            ? null
+            : new EventLogPropertySelector(query.Fields.Select(f => $"Event/EventData/Data[@Name='{f}']"));
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var record = reader.ReadEvent();
+            if (record is null) yield break;
+            var data = selector is null || record is not EventLogRecord typed
+                ? EventDataFromXml(record.ToXml())
+                : Named(query.Fields!, typed.GetPropertyValues(selector));
+            yield return new RawEvent(record.Id, record.ProviderName ?? "", record.TimeCreated ?? DateTime.MinValue,
+                record.MachineName ?? "", record.RecordId ?? 0, data);
+        }
+    }
+
+    private static Dictionary<string, string> Named(IReadOnlyList<string> names, IList<object?> values)
+    {
+        var data = new Dictionary<string, string>(names.Count, StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < names.Count && i < values.Count; i++)
+        {
+            var text = Format(names[i], values[i]);
+            if (text.Length > 0) data[names[i]] = text;
+        }
+        return data;
+    }
+
+    internal static string Format(string field, object? value) => value switch
+    {
+        null => "",
+        string s => s,
+        uint u when HexFields.Contains(field) => $"0x{u:x}",
+        int i when HexFields.Contains(field) => $"0x{i:x}",
+        ulong ul when HexFields.Contains(field) => $"0x{ul:x}",
+        SecurityIdentifier sid => sid.Value,
+        byte[] bytes => Convert.ToHexString(bytes),
+        IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+        _ => value.ToString() ?? "",
+    };
+
+    private static readonly XNamespace Ns = "http://schemas.microsoft.com/win/2004/08/events/event";
+
+    internal static Dictionary<string, string> EventDataFromXml(string xml)
+    {
+        var data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var root = XDocument.Parse(xml).Root;
+        if (root?.Element(Ns + "EventData") is { } eventData)
+        {
+            var i = 0;
+            foreach (var d in eventData.Elements())
+            {
+                i++;
+                data[d.Attribute("Name")?.Value ?? $"Param{i}"] = d.Value;
+            }
+        }
+        if (root?.Element(Ns + "UserData") is { } userData)
+        {
+            foreach (var leaf in userData.Descendants().Where(e => !e.HasElements))
+            {
+                data[leaf.Name.LocalName] = leaf.Value;
+            }
+        }
+        return data;
+    }
+}

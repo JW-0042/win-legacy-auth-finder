@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LegacyAuthFinder.App/LegacyAuthFinder.App.csproj" />
+    <Project Path="src/LegacyAuthFinder.Cli/LegacyAuthFinder.Cli.csproj" />
+    <Project Path="src/LegacyAuthFinder.Core/LegacyAuthFinder.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LegacyAuthFinder.Tests/LegacyAuthFinder.Tests.csproj" />
+  </Folder>
+</Solution>
