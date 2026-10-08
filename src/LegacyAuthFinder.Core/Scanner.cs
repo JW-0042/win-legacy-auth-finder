@@ -9,9 +9,8 @@ public sealed record ScanOptions(int Threads = 2, int MaxEvents = Scanner.Defaul
 public static class Scanner
 {
     /// <summary>Events kept for the event list. The summary always counts every event, also beyond this limit.</summary>
-    public const int DefaultMaxEvents = 5_000_000;
+    public const int DefaultMaxEvents = 2_000_000;
 
-    private const int FlushSize = 4096;
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromMilliseconds(300);
 
     /// <summary>Finds all .evtx files and works out which log each one belongs to.</summary>
@@ -42,10 +41,11 @@ public static class Scanner
         var pool = new StringPool();
         var gate = new Lock();
         var events = new List<AuthEvent>();
-        var summary = new Dictionary<(LegacyKind, string, string, string), SummaryRow>();
+        var summary = new Dictionary<SummaryKey, SummaryRow>(SummaryKey.Comparer);
         var results = new ConcurrentDictionary<string, FileProgress>(StringComparer.OrdinalIgnoreCase);
         long total = 0;
-        var truncated = false;
+        long kept = 0;
+        var truncated = 0;
 
         void Report(FileProgress p)
         {
@@ -53,29 +53,20 @@ public static class Scanner
             progress?.Report(p);
         }
 
-        void Flush(List<AuthEvent> batch)
+        // Each file builds its own summary and event list without any locking. They are merged once, when the file
+        // is finished. A shared lock per event made 16 parallel files no faster than 2.
+        void Merge(Dictionary<SummaryKey, SummaryRow> local, List<AuthEvent> localEvents, long hits)
         {
             lock (gate)
             {
-                foreach (var e in batch)
+                total += hits;
+                events.AddRange(localEvents);
+                foreach (var (key, row) in local)
                 {
-                    total++;
-                    var key = (e.Kind, e.Account.ToLowerInvariant(), e.Client.ToLowerInvariant(), e.Service.ToLowerInvariant());
-                    if (!summary.TryGetValue(key, out var row))
-                    {
-                        row = new SummaryRow { Kind = e.Kind, Account = e.Account, Client = e.Client, Service = e.Service };
-                        summary[key] = row;
-                    }
-                    row.Count++;
-                    if (e.Time < row.FirstSeen) row.FirstSeen = e.Time;
-                    if (e.Time > row.LastSeen) row.LastSeen = e.Time;
-                    if (e.Computer.Length > 0) row.Computers.Add(e.Computer);
-                    row.Variants.Add(e.Variant);
-                    if (events.Count < options.MaxEvents) events.Add(e);
-                    else truncated = true;
+                    if (summary.TryGetValue(key, out var existing)) existing.Absorb(row);
+                    else summary[key] = row;
                 }
             }
-            batch.Clear();
         }
 
         foreach (var file in files.Where(f => !f.IsRelevant))
@@ -83,16 +74,21 @@ public static class Scanner
             Report(new FileProgress(file.Path, file.Error is null ? FileState.Skipped : FileState.Error, 0, null,
                 file.Error ?? $"Skipped: {file.Channel} log cannot contain these events"));
         }
-        var relevant = files.Where(f => f.IsRelevant).ToList();
+        // Largest files first, so a big file does not start last and keep the scan running alone at the end.
+        var relevant = files.Where(f => f.IsRelevant).OrderByDescending(f => f.Size).ToList();
         foreach (var file in relevant) Report(new FileProgress(file.Path, FileState.Queued, 0, null, "Waiting"));
 
         var cancelled = false;
         try
         {
-            Parallel.ForEach(relevant, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, options.Threads), CancellationToken = cancellationToken }, file =>
+            // NoBuffering: a worker takes exactly one file at a time, so a waiting file starts as soon as any slot is free.
+            var source = Partitioner.Create(relevant, EnumerablePartitionerOptions.NoBuffering);
+            var parallel = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, options.Threads), CancellationToken = cancellationToken };
+            Parallel.ForEach(source, parallel, file =>
             {
                 Report(new FileProgress(file.Path, FileState.Scanning, 0, 0, "Scanning"));
-                var batch = new List<AuthEvent>(FlushSize);
+                var local = new Dictionary<SummaryKey, SummaryRow>(SummaryKey.Comparer);
+                var localEvents = new List<AuthEvent>();
                 long hits = 0;
                 var lastReport = Stopwatch.StartNew();
                 try
@@ -104,8 +100,9 @@ public static class Scanner
                             var e = Classifier.Classify(raw, file.Name, pool);
                             if (e is null) continue;
                             hits++;
-                            batch.Add(e);
-                            if (batch.Count >= FlushSize) Flush(batch);
+                            SummaryRow.Add(local, e);
+                            if (Interlocked.Increment(ref kept) <= options.MaxEvents) localEvents.Add(e);
+                            else Volatile.Write(ref truncated, 1);
                             if (lastReport.Elapsed > ProgressInterval)
                             {
                                 Report(new FileProgress(file.Path, FileState.Scanning, hits, Percent(file, raw.RecordId), $"{query.Name}: {hits:N0} found"));
@@ -113,18 +110,18 @@ public static class Scanner
                             }
                         }
                     }
-                    Flush(batch);
+                    Merge(local, localEvents, hits);
                     Report(new FileProgress(file.Path, FileState.Done, hits, 1, hits == 0 ? "Nothing found" : $"{hits:N0} events found"));
                 }
                 catch (OperationCanceledException)
                 {
-                    Flush(batch);
+                    Merge(local, localEvents, hits);
                     Report(new FileProgress(file.Path, FileState.Cancelled, hits, null, "Cancelled"));
                     throw;
                 }
                 catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException or System.Xml.XmlException)
                 {
-                    Flush(batch);
+                    Merge(local, localEvents, hits);
                     Report(new FileProgress(file.Path, FileState.Error, hits, null, ex.Message.Trim()));
                 }
             });
@@ -143,7 +140,7 @@ public static class Scanner
             .OrderBy(r => KindOrder(r.Kind))
             .ThenByDescending(r => r.Count)
             .ToList();
-        return new ScanResult(files, events, rows, results, total, truncated, cancelled, clock.Elapsed, scope);
+        return new ScanResult(files, events, rows, results, total, truncated == 1, cancelled, clock.Elapsed, scope);
     }
 
     /// <summary>Most urgent first, see <see cref="Guidance.Order"/>.</summary>

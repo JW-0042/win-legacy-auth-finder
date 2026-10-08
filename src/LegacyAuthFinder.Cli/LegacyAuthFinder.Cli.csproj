@@ -6,6 +6,9 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <!-- Many files are parsed in parallel and allocate a lot. Server GC scales with them, workstation GC does not. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <AssemblyName>legacy-auth-scan</AssemblyName>
   </PropertyGroup>
 

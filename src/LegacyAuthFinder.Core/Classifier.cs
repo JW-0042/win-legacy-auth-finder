@@ -17,7 +17,7 @@ public static class Classifier
     private static readonly string[] DetailFields =
     [
         "LogonType", "AuthenticationPackageName", "LmPackageName", "KeyLength", "LogonProcessName", "ProcessName",
-        "WorkstationName", "IpAddress", "IpPort", "Status", "SubStatus",
+        "WorkstationName", "IpAddress", "Status", "SubStatus",
         "TicketOptions", "PreAuthType", "FailureCode", "ClientAdvertizedEncryptionTypes",
         "AccountSupportedEncryptionTypes", "AccountAvailableKeys",
         "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
@@ -225,7 +225,7 @@ public static class Classifier
             pool.Get(session),
             pool.Get(file),
             e.RecordId,
-            fields);
+            fields.ToArray());
     }
 
     /// <summary>DES is worse than RC4, so DES wins when ticket and session key differ.</summary>
@@ -306,17 +306,8 @@ public static class Providers
 /// <summary>Shares identical strings between events. Millions of events repeat the same few hundred accounts and hosts.</summary>
 public sealed class StringPool
 {
-    private readonly Dictionary<string, string> _pool = new(StringComparer.Ordinal);
-    private readonly Lock _lock = new();
+    // Lock-free reads. A plain dictionary behind one lock made parallel scans wait on each other.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _pool = new(StringComparer.Ordinal);
 
-    public string Get(string value)
-    {
-        if (value.Length == 0) return "";
-        lock (_lock)
-        {
-            if (_pool.TryGetValue(value, out var existing)) return existing;
-            _pool[value] = value;
-            return value;
-        }
-    }
+    public string Get(string value) => value.Length == 0 ? "" : _pool.GetOrAdd(value, value);
 }

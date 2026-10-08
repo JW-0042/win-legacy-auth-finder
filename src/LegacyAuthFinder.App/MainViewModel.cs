@@ -16,6 +16,7 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
     private string _status = info.Error ?? (info.IsRelevant ? "Ready to scan" : "Skipped: not a Security, System or Directory Service log");
     private long _hits;
     private double _percent;
+    private DateTime? _startedAt;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -30,12 +31,29 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
 
     public FileState State { get => _state; private set { _state = value; OnChanged(); OnChanged(nameof(IsScanning)); } }
     public bool IsScanning => _state == FileState.Scanning;
-    public string Status { get => _status; private set { _status = value; OnChanged(); } }
+    public string Status { get => _status; private set { _status = value; OnChanged(); OnChanged(nameof(StatusText)); } }
+
+    /// <summary>
+    /// Status plus elapsed time while scanning. The Windows API only hands back matching records, so a file without
+    /// findings gives no other sign of life until it is done.
+    /// </summary>
+    public string StatusText => _state == FileState.Scanning && _startedAt is { } start
+        ? $"{_status} · {Elapsed(DateTime.Now - start)}"
+        : _status;
+
+    public static string Elapsed(TimeSpan t) => t.TotalHours >= 1 ? t.ToString(@"h\:mm\:ss") : t.ToString(@"m\:ss");
+
+    /// <summary>Called once a second by the view model to refresh the elapsed time.</summary>
+    public void Tick()
+    {
+        if (_state == FileState.Scanning) OnChanged(nameof(StatusText));
+    }
     public long Hits { get => _hits; private set { _hits = value; OnChanged(); } }
     public double Percent { get => _percent; private set { _percent = value; OnChanged(); } }
 
     public void Update(FileProgress p)
     {
+        if (p.State == FileState.Scanning && _state != FileState.Scanning) _startedAt = DateTime.Now;
         State = p.State;
         Status = p.Message;
         Hits = p.Hits;
@@ -52,6 +70,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly IEvtxReader _reader = new WindowsEvtxReader();
     private readonly DispatcherTimer _searchTimer;
+    private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
+    private Action? _onTick;
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _searchCts;
     private ScanResult? _result;
@@ -78,6 +98,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _searchTimer.Stop();
             await ApplyFilterAsync();
         };
+        _clock.Tick += (_, _) => _onTick?.Invoke();
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -269,6 +290,29 @@ public sealed class MainViewModel : INotifyPropertyChanged
         foreach (var row in rows.Values) Files.Add(row);
         var relevant = _inventory.Where(f => f.IsRelevant).ToList();
         var totalBytes = Math.Max(1, relevant.Sum(f => f.Size));
+        var started = DateTime.Now;
+
+        void Refresh()
+        {
+            var finishedBytes = relevant.Where(f => rows[f.Path].State is FileState.Done or FileState.Error or FileState.Cancelled).Sum(f => f.Size);
+            var done = finishedBytes + relevant
+                .Where(f => rows[f.Path].State == FileState.Scanning)
+                .Sum(f => (long)(f.Size * rows[f.Path].Percent / 100));
+            OverallProgress = 100.0 * done / totalBytes;
+            var finished = relevant.Count(f => rows[f.Path].State is FileState.Done or FileState.Error);
+            var running = relevant.Count(f => rows[f.Path].State is FileState.Scanning);
+            var elapsed = DateTime.Now - started;
+            var text = $"{finished} of {relevant.Count} logs done, {running} running · {Reports.SizeText(done)} of {Reports.SizeText(totalBytes)} · {rows.Values.Sum(r => r.Hits):N0} found · {FileRow.Elapsed(elapsed)}";
+            // Speed from finished files only, the only reliable measure. Shown once there is enough to go on.
+            if (finishedBytes > 0 && elapsed.TotalSeconds >= 10)
+            {
+                var rate = finishedBytes / elapsed.TotalSeconds;
+                var left = TimeSpan.FromSeconds(Math.Max(0, (totalBytes - finishedBytes) / rate));
+                text += $" · about {Reports.SizeText((long)rate)}/s, roughly {FileRow.Elapsed(left)} left";
+            }
+            StatusText = text;
+        }
+
         try
         {
             OverallProgress = 0;
@@ -276,14 +320,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var progress = new Progress<FileProgress>(p =>
             {
                 if (rows.TryGetValue(p.Path, out var row)) row.Update(p);
-                var done = relevant.Sum(f => rows[f.Path].State is FileState.Done or FileState.Error or FileState.Cancelled
-                    ? f.Size
-                    : (long)(f.Size * rows[f.Path].Percent / 100));
-                OverallProgress = 100.0 * done / totalBytes;
-                var finished = relevant.Count(f => rows[f.Path].State is FileState.Done or FileState.Error);
-                var running = relevant.Count(f => rows[f.Path].State is FileState.Scanning);
-                StatusText = $"{finished} of {relevant.Count} logs done, {running} running · {Reports.SizeText(done)} of {Reports.SizeText(totalBytes)} · {rows.Values.Sum(r => r.Hits):N0} found";
+                Refresh();
             });
+            _onTick = () =>
+            {
+                foreach (var row in rows.Values) row.Tick();
+                Refresh();
+            };
+            _clock.Start();
             var options = new ScanOptions(Threads);
             var inventory = _inventory;
             var result = await Task.Run(() => Scanner.Scan(_reader, inventory, folder, options, progress, token));
@@ -291,6 +335,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         finally
         {
+            _clock.Stop();
+            _onTick = null;
             IsBusy = false;
             StatusText = "";
         }

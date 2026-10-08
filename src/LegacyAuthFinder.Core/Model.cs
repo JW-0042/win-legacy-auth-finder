@@ -115,9 +115,51 @@ public sealed record AuthEvent(
     }
 }
 
+/// <summary>Grouping key of the summary. Account, client and service compare case-insensitively.</summary>
+public readonly record struct SummaryKey(LegacyKind Kind, string Account, string Client, string Service)
+{
+    public static IEqualityComparer<SummaryKey> Comparer { get; } = new KeyComparer();
+
+    private sealed class KeyComparer : IEqualityComparer<SummaryKey>
+    {
+        private static readonly StringComparer Text = StringComparer.OrdinalIgnoreCase;
+
+        public bool Equals(SummaryKey a, SummaryKey b) =>
+            a.Kind == b.Kind && Text.Equals(a.Account, b.Account) && Text.Equals(a.Client, b.Client) && Text.Equals(a.Service, b.Service);
+
+        public int GetHashCode(SummaryKey k) =>
+            HashCode.Combine(k.Kind, Text.GetHashCode(k.Account), Text.GetHashCode(k.Client), Text.GetHashCode(k.Service));
+    }
+}
+
 /// <summary>Events grouped by who and what: the list to work through when fixing things.</summary>
 public sealed class SummaryRow
 {
+    public static void Add(Dictionary<SummaryKey, SummaryRow> rows, AuthEvent e)
+    {
+        var key = new SummaryKey(e.Kind, e.Account, e.Client, e.Service);
+        if (!rows.TryGetValue(key, out var row))
+        {
+            row = new SummaryRow { Kind = e.Kind, Account = e.Account, Client = e.Client, Service = e.Service };
+            rows[key] = row;
+        }
+        row.Count++;
+        if (e.Time < row.FirstSeen) row.FirstSeen = e.Time;
+        if (e.Time > row.LastSeen) row.LastSeen = e.Time;
+        if (e.Computer.Length > 0) row.Computers.Add(e.Computer);
+        row.Variants.Add(e.Variant);
+    }
+
+    /// <summary>Adds another row for the same key, for example from another file.</summary>
+    public void Absorb(SummaryRow other)
+    {
+        Count += other.Count;
+        if (other.FirstSeen < FirstSeen) FirstSeen = other.FirstSeen;
+        if (other.LastSeen > LastSeen) LastSeen = other.LastSeen;
+        Computers.UnionWith(other.Computers);
+        Variants.UnionWith(other.Variants);
+    }
+
     public required LegacyKind Kind { get; init; }
     public required string Account { get; init; }
     public required string Client { get; init; }

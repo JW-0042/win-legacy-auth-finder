@@ -59,6 +59,8 @@ public partial class App : Application
         var folderArg = Array.IndexOf(args, "--folder");
         if (folderArg >= 0 && folderArg + 1 < args.Length)
         {
+            var threadsArg = Array.IndexOf(args, "--threads");
+            if (threadsArg >= 0 && threadsArg + 1 < args.Length && int.TryParse(args[threadsArg + 1], out var threads)) vm.Threads = threads;
             await vm.OpenFolderAsync(args[folderArg + 1]);
             if (!args.Contains("--no-scan")) await vm.StartScanAsync();
         }
