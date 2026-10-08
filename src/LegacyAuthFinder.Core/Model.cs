@@ -6,6 +6,12 @@ public enum LegacyKind
     Ntlmv1,
     Rc4,
     Des,
+    /// <summary>LDAP binds without signing or with a cleartext password (Directory Service 2887, 2889).</summary>
+    LdapSigning,
+    /// <summary>LDAP over TLS without a channel binding token (Directory Service 3039, 3074, 3075).</summary>
+    LdapChannelBinding,
+    /// <summary>Kerberos requests that failed because no common encryption type was found (KDC 14/16/26/27, status 0xE).</summary>
+    EtypeFailure,
 }
 
 /// <summary>One .evtx file found in the folder, before it is scanned.</summary>
@@ -22,26 +28,34 @@ public sealed record LogFileInfo(
 {
     public string Name => System.IO.Path.GetFileName(Path);
 
-    /// <summary>Only Security and System logs can contain the events this tool looks for.</summary>
-    public bool IsRelevant => Error is null && Channel is Channels.Security or Channels.System;
+    /// <summary>Only Security, System and Directory Service logs can contain the events this tool looks for.</summary>
+    public bool IsRelevant => Error is null && Channel is Channels.Security or Channels.System or Channels.DirectoryService;
 }
 
 public static class Channels
 {
     public const string Security = "Security";
     public const string System = "System";
+    public const string DirectoryService = "Directory Service";
 }
 
-/// <summary>An event as read from a file: system fields plus the named EventData values that were asked for.</summary>
+/// <summary>
+/// An event as read from a file: system fields plus the named EventData values that were asked for.
+/// <paramref name="Values"/> keeps EventData in document order for older events whose fields have no names.
+/// </summary>
 public sealed record RawEvent(
     int EventId,
     string Provider,
     DateTime Time,
     string Computer,
     long RecordId,
-    IReadOnlyDictionary<string, string> Data)
+    IReadOnlyDictionary<string, string> Data,
+    IReadOnlyList<string>? Values = null)
 {
     public string this[string name] => Data.TryGetValue(name, out var v) ? v : "";
+
+    /// <summary>The n-th EventData value (0-based), or an empty string.</summary>
+    public string At(int index) => Values is { } v && index < v.Count ? v[index] : "";
 }
 
 /// <summary>A legacy authentication event, reduced to what people search and group by.</summary>
@@ -70,6 +84,12 @@ public sealed record AuthEvent(
         4768 => "Kerberos TGT request",
         4769 => "Kerberos service ticket",
         4770 => "Kerberos ticket renewed",
+        4771 => "Kerberos pre-authentication failed",
+        2887 => "LDAP daily summary",
+        2889 => "LDAP bind without signing",
+        3039 => "LDAP channel binding failed",
+        3074 => "LDAP bind would fail channel binding",
+        3075 => "LDAP bind without channel binding info",
         _ => Guidance.KdcEventText(EventId),
     };
 

@@ -34,6 +34,8 @@ public partial class MainWindow : Window
 
     private async void Demo_Click(object sender, RoutedEventArgs e) => await Guard(Vm.LoadDemoAsync);
 
+    private async void StartScan_Click(object sender, RoutedEventArgs e) => await Guard(Vm.StartScanAsync);
+
     private void Cancel_Click(object sender, RoutedEventArgs e) => Vm.Cancel();
 
     private async Task Guard(Func<Task> action)

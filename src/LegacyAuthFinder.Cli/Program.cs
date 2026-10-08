@@ -24,9 +24,9 @@ for (var i = 0; i < args.Length; i++)
         case "--quiet": quiet = true; break;
         case "--demo": demo = true; break;
         case "-h" or "--help" or "/?":
-            Console.WriteLine("Legacy Auth Finder: finds NTLMv1, RC4 and DES authentication in archived Windows event logs (.evtx).");
+            Console.WriteLine("Legacy Auth Finder: finds NTLMv1, RC4, DES, unsigned LDAP and Kerberos encryption type errors in archived Windows event logs (.evtx).");
             Console.WriteLine(Usage);
-            Console.WriteLine("Every .evtx file in the folder is checked. Security and System logs are scanned, other logs are skipped.");
+            Console.WriteLine("Every .evtx file in the folder is checked. Security, System and Directory Service logs are scanned, other logs are skipped.");
             Console.WriteLine("Exit code 0 = nothing found, 1 = legacy authentication found, 3 = no readable log files.");
             return 0;
         default:
@@ -65,7 +65,7 @@ else
     }
     if (!files.Any(f => f.IsRelevant))
     {
-        Console.Error.WriteLine("No readable Security or System logs found.");
+        Console.Error.WriteLine("No readable Security, System or Directory Service logs found.");
         return 3;
     }
 
@@ -82,11 +82,12 @@ else
 if (!quiet)
 {
     Console.WriteLine();
-    Console.WriteLine($"Found {result.TotalHits:N0} events in {result.Duration.TotalSeconds:0.#} s: DES {result.Count(LegacyKind.Des):N0}, NTLMv1 {result.Count(LegacyKind.Ntlmv1):N0}, RC4 {result.Count(LegacyKind.Rc4):N0}.");
+    Console.WriteLine($"Found {result.TotalHits:N0} events in {result.Duration.TotalSeconds:0.#} s: "
+        + string.Join(", ", Guidance.Order.Select(k => $"{Guidance.Label(k)} {result.Count(k):N0}")) + ".");
     if (result.Cancelled) Console.WriteLine("The scan was cancelled. Results are incomplete.");
     foreach (var s in result.Summary.Take(25))
     {
-        Console.WriteLine($"  {s.KindLabel,-7} {s.Count,10:N0}  {s.Account,-32} {s.Client,-20} {s.Service}");
+        Console.WriteLine($"  {s.KindLabel,-13} {s.Count,10:N0}  {s.Account,-32} {s.Client,-20} {s.Service}");
     }
     if (result.Summary.Count > 25) Console.WriteLine($"  … {result.Summary.Count - 25} more rows. Use --summary-csv for the full list.");
 }

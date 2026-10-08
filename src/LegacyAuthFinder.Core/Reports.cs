@@ -60,7 +60,16 @@ public static class Reports
         scope = r.Scope,
         durationSeconds = Math.Round(r.Duration.TotalSeconds, 1),
         cancelled = r.Cancelled,
-        totals = new { ntlmv1 = r.Count(LegacyKind.Ntlmv1), rc4 = r.Count(LegacyKind.Rc4), des = r.Count(LegacyKind.Des), all = r.TotalHits },
+        totals = new
+        {
+            ntlmv1 = r.Count(LegacyKind.Ntlmv1),
+            rc4 = r.Count(LegacyKind.Rc4),
+            des = r.Count(LegacyKind.Des),
+            ldapUnsigned = r.Count(LegacyKind.LdapSigning),
+            ldapChannelBinding = r.Count(LegacyKind.LdapChannelBinding),
+            etypeErrors = r.Count(LegacyKind.EtypeFailure),
+            all = r.TotalHits,
+        },
         files = r.Files.Select(f => new
         {
             path = f.Path,
@@ -98,25 +107,25 @@ public static class Reports
         sb.Append("h1{margin:0 0 4px}.meta{color:#5b6470;margin:0 0 24px}.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}");
         sb.Append(".tile{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:12px 16px;min-width:130px}.tile b{display:block;font-size:24px}");
         sb.Append("table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e1e4e8;margin-bottom:24px;font-size:13px}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid #eef0f2;vertical-align:top}");
-        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.DES{color:#b0124f}.NTLMv1{color:#d93025}.RC4{color:#c25e00}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
+        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.Des{color:#b0124f}.Ntlmv1{color:#d93025}.Rc4{color:#c25e00}.LdapSigning{color:#7c3aed}.LdapChannelBinding{color:#0e7490}.EtypeFailure{color:#2f6fd6}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
         sb.Append($"<h1>Legacy authentication report</h1><p class=\"meta\">{E(r.Scope)} · {r.Files.Count} files · {r.Duration.TotalMinutes:0.#} minutes{(r.Cancelled ? " · scan was cancelled, results are incomplete" : "")}</p>");
         sb.Append("<div class=\"tiles\">");
-        foreach (var kind in new[] { LegacyKind.Des, LegacyKind.Ntlmv1, LegacyKind.Rc4 })
+        foreach (var kind in Guidance.Order)
         {
             sb.Append($"<div class=\"tile\">{Guidance.Label(kind)} events<b>{r.Count(kind):N0}</b></div>");
         }
         sb.Append("</div>");
 
-        foreach (var kind in new[] { LegacyKind.Des, LegacyKind.Ntlmv1, LegacyKind.Rc4 }.Where(k => r.Count(k) > 0))
+        foreach (var kind in Guidance.Order.Where(k => r.Count(k) > 0))
         {
             var g = Guidance.For(kind);
-            sb.Append($"<div class=\"g\"><b class=\"{g.Label}\">{E(g.Label)}</b><p>{E(g.Risk)}</p><p><b>What to do:</b> {E(g.Fix)}</p></div>");
+            sb.Append($"<div class=\"g\"><b class=\"{kind}\">{E(g.Label)}</b><p>{E(g.Risk)}</p><p><b>What to do:</b> {E(g.Fix)}</p></div>");
         }
 
         sb.Append($"<h2>Who still uses it</h2><table><tr><th>Type</th><th>Account</th><th>Client</th><th>Service</th><th>Count</th><th>First seen</th><th>Last seen</th><th>Logged on</th></tr>");
         foreach (var s in r.Summary.Take(HtmlSummaryRows))
         {
-            sb.Append($"<tr><td class=\"k {s.KindLabel}\">{s.KindLabel}</td><td>{E(s.Account)}</td><td>{E(s.Client)}</td><td>{E(s.Service)}</td><td>{s.Count:N0}</td><td>{s.FirstSeen:yyyy-MM-dd HH:mm}</td><td>{s.LastSeen:yyyy-MM-dd HH:mm}</td><td>{E(s.ComputersText)}</td></tr>");
+            sb.Append($"<tr><td class=\"k {s.Kind}\">{s.KindLabel}</td><td>{E(s.Account)}</td><td>{E(s.Client)}</td><td>{E(s.Service)}</td><td>{s.Count:N0}</td><td>{s.FirstSeen:yyyy-MM-dd HH:mm}</td><td>{s.LastSeen:yyyy-MM-dd HH:mm}</td><td>{E(s.ComputersText)}</td></tr>");
         }
         sb.Append("</table>");
         if (r.Summary.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Summary.Count} rows. Export the summary as CSV for the full list.</p>");

@@ -4,7 +4,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)
 
-Legacy Auth Finder finds **NTLMv1, RC4 and DES** authentication in archived Windows event logs. Point it at a folder of `.evtx` files copied from your servers and domain controllers. It works out which log each file is, scans the Security and System logs and shows you who still uses the old protocols. You can search the results and export them. Files of 4 GB and more are fine.
+Legacy Auth Finder finds **NTLMv1, RC4, DES and unsigned LDAP** in archived Windows event logs, plus the Kerberos requests that already fail for lack of a common encryption type. Point it at a folder of `.evtx` files copied from your servers and domain controllers. It works out which log each file is, then scans the Security, System and Directory Service logs when you press Start scan. It shows who still uses the old protocols, and you can search the results and export them. Files of 4 GB and more are fine.
 
 ![Legacy Auth Finder, summary of who still uses legacy authentication](docs/screenshot-summary-light.png)
 
@@ -38,15 +38,22 @@ Legacy Auth Finder does all of that in one pass and gives you that list.
 | RC4 | Security log, events 4768, 4769, 4770 (domain controllers) | `TicketEncryptionType` or `SessionKeyEncryptionType` is `0x17` or `0x18` |
 | DES | Security log, events 4768, 4769, 4770 (domain controllers) | `TicketEncryptionType` or `SessionKeyEncryptionType` is `0x1` or `0x3` |
 | RC4 warnings | System log, KDCSVC events 201 to 209 (domain controllers) | Added by Microsoft in 2026 for the RC4 phase-out |
+| Unsigned LDAP | Directory Service log, events 2889 and 2887 (domain controllers) | 2889 names the client, the account and the bind type: SASL without signing or a simple bind with a cleartext password. 2887 is the daily count. |
+| LDAP channel binding | Directory Service log, events 3039, 3074, 3075 | Clients that connect over LDAPS without a valid channel binding token |
+| Encryption type errors | System log, KDC events 14, 16, 26, 27, and Security events 4768, 4769, 4771 with status `0xE` | Kerberos requests that failed because client, account and domain controller had no encryption type in common. These are what breaks when RC4 or DES is turned off. |
 
 Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAvailableKeys` and related fields in 4768 and 4769. The tool shows them in the detail pane. They tell you whether the client or the service account is the reason RC4 was used.
 
-**Auditing must be on.** NTLMv1 shows up only when "Audit Logon" success is enabled on the server. RC4 and DES show up only when "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" are enabled on the domain controllers.
+**Auditing must be on.**
+- NTLMv1 shows up only when "Audit Logon" success is enabled on the server.
+- RC4, DES and the `0xE` failures show up only when "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" are enabled on the domain controllers (failure auditing for the `0xE` events).
+- Event 2889 needs the "16 LDAP Interface Events" diagnostic value set to 2 on the domain controllers. Without it you only get the daily summary 2887, which tells you that unsigned binds happen but not who makes them.
+- Channel binding events appear only when the domain controller's channel binding policy is set to "When supported" or "Always".
 
 ## How it works
 
-1. **Inventory.** Every `.evtx` file in the folder and its subfolders is opened and its first record tells which log it belongs to. File names like `Archive-Security-...` are not trusted. Unreadable or damaged files are listed with the reason.
-2. **Scan.** Security and System logs are scanned with XPath filters that run inside the Windows event log API. A 4 GB file is streamed, never loaded into memory, and only matching records reach the tool. Several files are scanned in parallel.
+1. **Inventory.** When you open a folder, every `.evtx` file in it and its subfolders is opened and its first record tells which log it belongs to. File names like `Archive-Security-...` are not trusted. Unreadable or damaged files are listed with the reason. Nothing is scanned yet, so you can check the file list first.
+2. **Scan.** Press Start scan. Security, System and Directory Service logs are scanned with XPath filters that run inside the Windows event log API. A 4 GB file is streamed, never loaded into memory, and only matching records reach the tool. Up to 16 files are scanned in parallel: 8 or more pays off on SSDs and network shares, while a single hard disk is usually fastest with 2 to 4.
 3. **Results.**
    - **Who uses it** groups the events by type, account, client and service, with counts and first and last seen. This is your to-do list.
    - **Events** lists every single event and is searchable.
@@ -80,7 +87,7 @@ legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [
 | 0 | Nothing found |
 | 1 | NTLMv1, RC4 or DES found |
 | 2 | Invalid arguments |
-| 3 | No readable Security or System logs in the folder |
+| 3 | No readable Security, System or Directory Service logs in the folder |
 
 Example:
 

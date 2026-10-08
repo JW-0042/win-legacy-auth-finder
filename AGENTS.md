@@ -31,4 +31,8 @@ LegacyAuthFinder.exe --screenshot docs/screenshot-events-light.png --theme light
 LegacyAuthFinder.exe --screenshot docs/screenshot-files-light.png --theme light --tab files
 ```
 
-`--folder <path>` in screenshot mode scans a real folder instead of the demo. It is for local testing only and must never be used for images that get published.
+`--folder <path>` in screenshot mode scans a real folder instead of the demo (add `--no-scan` to stop after the file list). It is for local testing only and must never be used for images that get published.
+
+## Event data without names
+
+Older events (KDC 14/16/26/27, Directory Service 2887/2889/30xx) have unnamed insertion strings. Their queries use `Positional: true` and the classifier reads them with `RawEvent.At(index)`. The order is taken from Microsoft's documented message text. Keep the comments in `Classifier` in sync when you change it.

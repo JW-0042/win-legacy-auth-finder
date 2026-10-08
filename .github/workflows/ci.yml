@@ -39,5 +39,5 @@ jobs:
           dotnet run --project src/LegacyAuthFinder.Cli -c Release --no-build -- --demo --json demo.json --quiet
           if ($LASTEXITCODE -ne 1) { throw "Demo data should report findings" }
           $r = Get-Content demo.json | ConvertFrom-Json
-          if ($r.totals.des -lt 1 -or $r.totals.ntlmv1 -lt 1 -or $r.totals.rc4 -lt 1) { throw "Demo should contain every type" }
+          if ($r.totals.des -lt 1 -or $r.totals.ntlmv1 -lt 1 -or $r.totals.rc4 -lt 1 -or $r.totals.ldapUnsigned -lt 1 -or $r.totals.ldapChannelBinding -lt 1 -or $r.totals.etypeErrors -lt 1) { throw "Demo should contain every type" }
           exit 0

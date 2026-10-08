@@ -3,6 +3,8 @@ namespace LegacyAuthFinder.Core;
 /// <summary>
 /// A made-up CONTOSO domain with two domain controllers and a file server. Old copiers and a legacy XP box use
 /// NTLMv1, service accounts with old passwords get RC4 tickets and one Unix service still asks for DES.
+/// The copier also reads the directory over plain LDAP with a cleartext password, and the Unix box fails Kerberos
+/// whenever it asks for AES.
 /// The events go through the real scanner, classifier and summary, only the file reading is simulated.
 /// Addresses are private ranges, names are fictional.
 /// </summary>
@@ -30,6 +32,7 @@ public static class DemoData
                 File(@"DC01\Archive-Security-2026-09-20-08-14-02-311.evtx", Channels.Security, "DC01.contoso.local", 4_291_821_568, 0, 7),
                 File(@"DC01\Archive-Security-2026-09-27-11-40-55-902.evtx", Channels.Security, "DC01.contoso.local", 4_294_901_760, 7, 14),
                 File(@"DC01\Archive-System-2026-09-20-00-00-00-000.evtx", Channels.System, "DC01.contoso.local", 68_157_440, 0, 14),
+                File(@"DC01\Archive-Directory Service-2026-09-20-00-00-00-000.evtx", Channels.DirectoryService, "DC01.contoso.local", 268_435_456, 0, 14),
                 File(@"DC02\Archive-Security-2026-09-21-02-12-47-118.evtx", Channels.Security, "DC02.contoso.local", 3_872_391_168, 0, 14),
                 File(@"FS01\Archive-Security-2026-09-20-17-03-12-555.evtx", Channels.Security, "FS01.contoso.local", 1_073_676_288, 0, 14),
                 File(@"FS01\Archive-Application-2026-09-20-17-03-12-555.evtx", "Application", "FS01.contoso.local", 20_975_616, 0, 14),
@@ -61,6 +64,36 @@ public static class DemoData
 
             // KDC RC4 audit warnings.
             Kdc(random, "DC01", 201, "PRN-COPIER-2F$", "ldap/dc01.contoso.local", 12);
+
+            // Unsigned and cleartext LDAP binds, logged with "16 LDAP Interface Events" = 2.
+            Ldap(random, "DC01", 2889, "10.0.20.15", @"CONTOSO\svc-scan", "1", 820);
+            Ldap(random, "DC01", 2889, "10.0.20.40", @"CONTOSO\backup-svc", "0", 300);
+            Ldap(random, "DC01", 2889, "10.0.10.12", @"CONTOSO\it.admin", "0", 45);
+            Ldap(random, "DC01", 3074, "10.0.40.5", @"CONTOSO\unix-svc", "", 30);
+            Ldap(random, "DC01", 3039, "10.0.40.5", @"CONTOSO\unix-svc", "", 5);
+            for (var day = 0; day < 14; day++)
+            {
+                Add(PathFor("DC01", Channels.DirectoryService), new RawEvent(2887, Providers.DirectoryService, _start.AddDays(day).AddHours(9),
+                    "DC01.contoso.local", 0, new Dictionary<string, string>(), [random.Next(50, 70).ToString(), random.Next(20, 30).ToString()]));
+            }
+
+            // Kerberos requests that fail for lack of a common encryption type.
+            KdcEtype(random, "DC01", 16, "host/aix01.contoso.local", "unix-svc", "18 17 23", "3 1", 12);
+            KdcEtype(random, "DC01", 27, "krbtgt", "admin-old", "18 17", "23", 6);
+            for (var i = 0; i < 25; i++)
+            {
+                Add(PathFor("DC01", Channels.Security), new RawEvent(4769, Providers.SecurityAuditing, RandomTime(random), "DC01.contoso.local", 0,
+                    new Dictionary<string, string>
+                    {
+                        ["TargetUserName"] = $"unix-svc@{Realm}",
+                        ["TargetDomainName"] = Realm,
+                        ["ServiceName"] = "nfs/aix01.contoso.local",
+                        ["IpAddress"] = "::ffff:10.0.40.5",
+                        ["Status"] = "0xe",
+                        ["TicketEncryptionType"] = "0xffffffff",
+                        ["ClientAdvertizedEncryptionTypes"] = "DES-CBC-MD5, DES-CBC-CRC",
+                    }));
+            }
             Kdc(random, "DC01", 202, "svc-erp", "HTTP/erp.contoso.local", 9);
             Kdc(random, "DC01", 207, "admin-old", "krbtgt", 4);
         }
@@ -139,6 +172,26 @@ public static class DemoData
             }
         }
 
+        private void Ldap(Random r, string host, int id, string ip, string identity, string bindType, int count)
+        {
+            for (var i = 0; i < count; i++)
+            {
+                List<string> values = [$"{ip}:{r.Next(49152, 65535)}", identity];
+                if (bindType.Length > 0) values.Add(bindType);
+                Add(PathFor(host, Channels.DirectoryService), new RawEvent(id, Providers.DirectoryService, RandomTime(r), $"{host}.contoso.local", 0,
+                    new Dictionary<string, string>(), values));
+            }
+        }
+
+        private void KdcEtype(Random r, string host, int id, string service, string account, string requested, string available, int count)
+        {
+            for (var i = 0; i < count; i++)
+            {
+                Add(PathFor(host, Channels.System), new RawEvent(id, Providers.Kdc, RandomTime(r), $"{host}.contoso.local", 0,
+                    new Dictionary<string, string>(), [service, account, "1", requested, available]));
+            }
+        }
+
         public LogFileInfo Inspect(string path) => Files.First(f => f.Path == path);
 
         public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
@@ -147,11 +200,19 @@ public static class DemoData
             foreach (var e in list.OrderBy(e => e.Time))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var matches = query == Queries.Ntlmv1 ? e.EventId is 4624 or 4625
-                    : query == Queries.Kerberos ? e.EventId is 4768 or 4769 or 4770
-                    : Providers.IsKdc(e.Provider);
-                if (matches) yield return e;
+                if (QueryOf(e) == query) yield return e;
             }
         }
     }
+
+    /// <summary>Which query would return this event from a real file.</summary>
+    internal static EvtxQuery QueryOf(RawEvent e) => e.EventId switch
+    {
+        4624 or 4625 => Queries.Ntlmv1,
+        4768 or 4769 or 4770 or 4771 when e["Status"] is "0xe" || e["FailureCode"] is "0xe" => Queries.KerberosEtypeFailures,
+        4768 or 4769 or 4770 => Queries.Kerberos,
+        14 or 16 or 26 or 27 => Queries.KdcEtypeErrors,
+        >= 201 and <= 209 => Queries.KdcWarnings,
+        _ => Queries.Ldap,
+    };
 }

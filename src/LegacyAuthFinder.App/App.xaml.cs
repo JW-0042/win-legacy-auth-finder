@@ -57,7 +57,11 @@ public partial class App : Application
         var vm = (MainViewModel)window.DataContext;
         // --folder is for testing the real scan path. README screenshots always use the demo data.
         var folderArg = Array.IndexOf(args, "--folder");
-        if (folderArg >= 0 && folderArg + 1 < args.Length) await vm.OpenFolderAsync(args[folderArg + 1]);
+        if (folderArg >= 0 && folderArg + 1 < args.Length)
+        {
+            await vm.OpenFolderAsync(args[folderArg + 1]);
+            if (!args.Contains("--no-scan")) await vm.StartScanAsync();
+        }
         else await vm.LoadDemoAsync();
         var tab = Array.IndexOf(args, "--tab") is var ti && ti >= 0 && ti + 1 < args.Length ? args[ti + 1] : "summary";
         if (tab == "events")
@@ -73,7 +77,7 @@ public partial class App : Application
         }
         else
         {
-            // An RC4 service account is the most common real finding, so open on it.
+            // An RC4 service account is the most common real finding, so open on it unless asked for another row.
             var grid = (System.Windows.Controls.DataGrid)window.FindName("SummaryGrid");
             grid.SelectedItem = vm.Summary.FirstOrDefault(s => s.Account.StartsWith("svc-erp")) ?? vm.Summary.FirstOrDefault();
         }

@@ -41,6 +41,17 @@ No real NTLMv1 or RC4 traffic was available on my machine, so the tests come in 
 - **CI** has admin rights, so it also exports and scans the runner's real Security log.
 - **The demo domain** runs through the real scanner and summary.
 
+## Version 0.2: listening to the user
+
+After the first release I asked whether the Directory Service log should be scanned too. It should, but for a different problem: domain controllers log unsigned and cleartext LDAP binds there, which Windows Server 2025 refuses by default. Version 0.2 adds:
+- unsigned LDAP (2889 and 2887),
+- LDAP channel binding (3039, 3074, 3075),
+- Kerberos requests that already fail for lack of a common encryption type (KDC 14/16/26/27 and status 0xE). These show what will break when RC4 or DES is switched off.
+
+Two usability changes came from real use: opening a folder no longer starts the scan right away, so you can check the file list first, and up to 16 files can be scanned at once for fast disks and network shares.
+
+These older events have no field names, only numbered insertion strings. Their order comes from the message text Microsoft documents, and an integration test checks that positional reading returns real values in the right order.
+
 ## Quality gates
 
 - The build treats warnings as errors.

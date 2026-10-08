@@ -113,5 +113,21 @@ public sealed class WindowsReaderTests(ITestOutputHelper output) : IDisposable
         Assert.Equal("0x17", WindowsEvtxReader.Format("TicketEncryptionType", 23u));
         Assert.Equal("3", WindowsEvtxReader.Format("LogonType", 3u));
         Assert.Equal("", WindowsEvtxReader.Format("X", null));
+        Assert.Equal("0xe", WindowsEvtxReader.Format("FailureCode", 14u));
+    }
+
+    [Fact]
+    public void Positional_queries_return_values_in_order()
+    {
+        var system = Export("System", "sys-pos.evtx")!;
+        var query = new EvtxQuery("test", "System", "*[System[Provider[@Name='Microsoft-Windows-Kernel-General'] and EventID=16]]", null, Positional: true);
+        var events = _reader.Read(system, query, CancellationToken.None).Take(10).ToList();
+        if (events.Count == 0)
+        {
+            output.WriteLine("No Kernel-General 16 events on this machine.");
+            return;
+        }
+        // Kernel-General 16: HiveNameLength, HiveName, KeysUpdated, DirtyPages.
+        Assert.All(events, e => Assert.Contains("\\", e.At(1)));
     }
 }

@@ -8,9 +8,10 @@ namespace LegacyAuthFinder.Core;
 /// <summary>
 /// One filtered pass over a file. The XPath filter runs inside the Windows event log API, so a 4 GB file is
 /// streamed and only matching records reach .NET. Fields are pulled by name with a property selector, which is
-/// much faster than rendering XML. Fields null means the full EventData is read through XML (used for rare events).
+/// much faster than rendering XML. Fields null means the full EventData is read through XML (used for rare events),
+/// unless <paramref name="Positional"/> is set: then the unnamed insertion strings are read in order, which is fast.
 /// </summary>
-public sealed record EvtxQuery(string Name, string Channel, string XPath, IReadOnlyList<string>? Fields);
+public sealed record EvtxQuery(string Name, string Channel, string XPath, IReadOnlyList<string>? Fields, bool Positional = false);
 
 public interface IEvtxReader
 {
@@ -35,6 +36,8 @@ public static class Queries
         "DCSupportedEncryptionTypes", "DCAvailableKeys",
     ];
 
+    public static readonly IReadOnlyList<string> KerberosFailureFields = [.. KerberosFields, "FailureCode"];
+
     private static readonly string[] WeakEtypes = ["0x17", "0x18", "0x1", "0x3"];
 
     public static EvtxQuery Ntlmv1 { get; } = new("NTLMv1 logons", Channels.Security,
@@ -55,7 +58,22 @@ public static class Queries
         $"*[System[(Provider[@Name='{Providers.KdcSvc}'] or Provider[@Name='{Providers.Kdc}']) and (EventID>=201 and EventID<=209)]]",
         null);
 
-    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KdcWarnings];
+    // KDC_ERR_ETYPE_NOSUPP. Hex values are rendered in lower case, the upper case variant is only a safety net.
+    public static EvtxQuery KerberosEtypeFailures { get; } = new("Kerberos encryption type failures", Channels.Security,
+        "*[System[(EventID=4768 or EventID=4769 or EventID=4771)] and EventData["
+        + "Data[@Name='Status']='0xe' or Data[@Name='Status']='0xE' or Data[@Name='FailureCode']='0xe' or Data[@Name='FailureCode']='0xE']]",
+        KerberosFailureFields);
+
+    public static EvtxQuery KdcEtypeErrors { get; } = new("KDC encryption type errors", Channels.System,
+        $"*[System[Provider[@Name='{Providers.Kdc}'] and (EventID=14 or EventID=16 or EventID=26 or EventID=27)]]",
+        null, Positional: true);
+
+    // Logged on domain controllers. 2889 needs the "16 LDAP Interface Events" diagnostic value set to 2.
+    public static EvtxQuery Ldap { get; } = new("LDAP signing and channel binding", Channels.DirectoryService,
+        "*[System[(EventID=2887 or EventID=2889 or EventID=3039 or EventID=3074 or EventID=3075)]]",
+        null, Positional: true);
+
+    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KerberosEtypeFailures, KdcWarnings, KdcEtypeErrors, Ldap];
 
     public static IEnumerable<EvtxQuery> For(string channel) => All.Where(q => q.Channel == channel);
 }
@@ -64,7 +82,7 @@ public sealed class WindowsEvtxReader : IEvtxReader
 {
     private static readonly HashSet<string> HexFields = new(StringComparer.Ordinal)
     {
-        "TicketEncryptionType", "SessionKeyEncryptionType", "TicketOptions", "Status", "SubStatus",
+        "TicketEncryptionType", "SessionKeyEncryptionType", "TicketOptions", "Status", "SubStatus", "FailureCode",
     };
 
     public LogFileInfo Inspect(string path)
@@ -101,11 +119,23 @@ public sealed class WindowsEvtxReader : IEvtxReader
             cancellationToken.ThrowIfCancellationRequested();
             using var record = reader.ReadEvent();
             if (record is null) yield break;
-            var data = selector is null || record is not EventLogRecord typed
-                ? EventDataFromXml(record.ToXml())
-                : Named(query.Fields!, typed.GetPropertyValues(selector));
+            Dictionary<string, string> data;
+            IReadOnlyList<string>? values = null;
+            if (query.Positional)
+            {
+                data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                values = record.Properties.Select(p => Format("", p.Value)).ToList();
+            }
+            else if (selector is null || record is not EventLogRecord typed)
+            {
+                (data, values) = EventDataFromXml(record.ToXml());
+            }
+            else
+            {
+                data = Named(query.Fields!, typed.GetPropertyValues(selector));
+            }
             yield return new RawEvent(record.Id, record.ProviderName ?? "", record.TimeCreated ?? DateTime.MinValue,
-                record.MachineName ?? "", record.RecordId ?? 0, data);
+                record.MachineName ?? "", record.RecordId ?? 0, data, values);
         }
     }
 
@@ -135,17 +165,19 @@ public sealed class WindowsEvtxReader : IEvtxReader
 
     private static readonly XNamespace Ns = "http://schemas.microsoft.com/win/2004/08/events/event";
 
-    internal static Dictionary<string, string> EventDataFromXml(string xml)
+    internal static (Dictionary<string, string> Data, List<string> Values) EventDataFromXml(string xml)
     {
         var data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var values = new List<string>();
         var root = XDocument.Parse(xml).Root;
         if (root?.Element(Ns + "EventData") is { } eventData)
         {
             var i = 0;
-            foreach (var d in eventData.Elements())
+            foreach (var d in eventData.Elements(Ns + "Data"))
             {
                 i++;
                 data[d.Attribute("Name")?.Value ?? $"Param{i}"] = d.Value;
+                values.Add(d.Value);
             }
         }
         if (root?.Element(Ns + "UserData") is { } userData)
@@ -153,8 +185,9 @@ public sealed class WindowsEvtxReader : IEvtxReader
             foreach (var leaf in userData.Descendants().Where(e => !e.HasElements))
             {
                 data[leaf.Name.LocalName] = leaf.Value;
+                values.Add(leaf.Value);
             }
         }
-        return data;
+        return (data, values);
     }
 }

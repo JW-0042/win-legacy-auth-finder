@@ -52,21 +52,26 @@
         <ScrollViewer Grid.Column="0" Margin="0,0,16,0" VerticalScrollBarVisibility="Auto">
             <StackPanel>
                 <TextBlock Text="Legacy Auth Finder" FontSize="22" FontWeight="SemiBold" />
-                <TextBlock Text="NTLMv1, RC4 and DES in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,14" />
+                <TextBlock Text="NTLMv1, RC4, DES and unsigned LDAP in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,14" />
 
                 <Button Content="Open folder…" Click="OpenFolder_Click" IsEnabled="{Binding CanAct}"
-                        Style="{DynamicResource AccentButtonStyle}" HorizontalAlignment="Stretch" Padding="8,10" Margin="0,0,0,8" />
+                        HorizontalAlignment="Stretch" Padding="8,9" Margin="0,0,0,8" />
                 <TextBlock Text="{Binding Folder}" TextWrapping="Wrap" FontSize="12" Opacity="0.7" Margin="0,0,0,8"
                            Visibility="{Binding HasFolder, Converter={StaticResource BoolToVis}}" />
                 <CheckBox Content="Include subfolders" IsChecked="{Binding Recurse}" IsEnabled="{Binding CanAct}" Margin="0,0,0,6" />
-                <Grid Margin="0,0,0,12">
+                <Grid Margin="0,0,0,4">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="80" />
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Files scanned at once" VerticalAlignment="Center" />
-                    <ComboBox Grid.Column="1" ItemsSource="{Binding ThreadChoices}" SelectedItem="{Binding Threads}" IsEnabled="{Binding CanAct}" />
+                    <ComboBox Grid.Column="1" ItemsSource="{Binding ThreadChoices}" SelectedItem="{Binding Threads}" IsEnabled="{Binding CanAct}"
+                              ToolTip="More files at once is faster on SSDs and network shares. On a single hard disk 2 to 4 is usually fastest." />
                 </Grid>
+                <TextBlock Text="SSD or network share: 8 or more. One hard disk: 2 to 4." FontSize="12" Opacity="0.6" TextWrapping="Wrap" Margin="0,0,0,10" />
+
+                <Button Content="{Binding ScanButtonText}" Click="StartScan_Click" IsEnabled="{Binding CanScan}"
+                        Style="{DynamicResource AccentButtonStyle}" HorizontalAlignment="Stretch" Padding="8,10" Margin="0,0,0,12" />
 
                 <StackPanel Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}" Margin="0,0,0,12">
                     <ProgressBar Value="{Binding OverallProgress, Mode=OneWay}" Maximum="100" Height="6" Margin="0,0,0,6" />
@@ -79,17 +84,23 @@
                         BorderBrush="{DynamicResource ControlStrokeColorDefaultBrush}" BorderThickness="1">
                     <StackPanel>
                         <TextBlock Text="{Binding HeadlineText}" TextWrapping="Wrap" FontWeight="SemiBold" Margin="0,0,0,10" />
-                        <UniformGrid Columns="3" Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
-                            <Border Style="{StaticResource Tile}" BorderBrush="#B0124F">
-                                <StackPanel><TextBlock Text="DES" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding DesCount}" FontSize="17" FontWeight="Bold" /></StackPanel>
-                            </Border>
-                            <Border Style="{StaticResource Tile}" BorderBrush="#D93025">
-                                <StackPanel><TextBlock Text="NTLMv1" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding NtlmCount}" FontSize="17" FontWeight="Bold" /></StackPanel>
-                            </Border>
-                            <Border Style="{StaticResource Tile}" BorderBrush="#C25E00">
-                                <StackPanel><TextBlock Text="RC4" FontSize="12" Opacity="0.7" /><TextBlock Text="{Binding Rc4Count}" FontSize="17" FontWeight="Bold" /></StackPanel>
-                            </Border>
-                        </UniformGrid>
+                        <ItemsControl ItemsSource="{Binding Tiles}" Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <UniformGrid Columns="2" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Style="{StaticResource Tile}" BorderBrush="{Binding Kind, Converter={StaticResource KindBrush}}">
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Label}" FontSize="12" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding Count}" FontSize="17" FontWeight="Bold" />
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
                         <TextBlock Text="{Binding TruncatedText}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" Margin="0,6,0,0"
                                    Visibility="{Binding IsTruncated, Converter={StaticResource BoolToVis}}" />
                     </StackPanel>
@@ -127,7 +138,7 @@
                     <DataGrid x:Name="SummaryGrid" Style="{StaticResource Grid}" ItemsSource="{Binding Summary}" SelectionChanged="Grid_SelectionChanged"
                               MouseDoubleClick="SummaryGrid_DoubleClick">
                         <DataGrid.Columns>
-                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="80" SortMemberPath="KindLabel" />
+                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="118" SortMemberPath="KindLabel" />
                             <DataGridTextColumn Header="Account" Binding="{Binding Account}" Width="2*" />
                             <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="*" />
                             <DataGridTextColumn Header="Service" Binding="{Binding Service}" Width="2*" />
@@ -142,7 +153,7 @@
                               SelectionChanged="Grid_SelectionChanged">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Time" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm:ss}" Width="140" />
-                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="80" />
+                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="118" />
                             <DataGridTextColumn Header="ID" Binding="{Binding EventId}" Width="50" />
                             <DataGridTextColumn Header="Account" Binding="{Binding Account}" Width="2*" />
                             <DataGridTextColumn Header="Client" Binding="{Binding Client}" Width="*" />

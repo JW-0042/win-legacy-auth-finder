@@ -13,7 +13,7 @@ public sealed record DetailRow(string Label, string Value);
 public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChanged
 {
     private FileState _state = info.IsRelevant ? FileState.Queued : info.Error is null ? FileState.Skipped : FileState.Error;
-    private string _status = info.Error ?? (info.IsRelevant ? "Waiting" : "Skipped: not a Security or System log");
+    private string _status = info.Error ?? (info.IsRelevant ? "Ready to scan" : "Skipped: not a Security, System or Directory Service log");
     private long _hits;
     private double _percent;
 
@@ -45,6 +45,9 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
     private void OnChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
+/// <summary>One total in the summary card.</summary>
+public sealed record KindTile(LegacyKind Kind, string Label, string Count);
+
 public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly IEvtxReader _reader = new WindowsEvtxReader();
@@ -64,6 +67,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private IReadOnlyList<SummaryRow> _summary = [];
     private int _tab;
     private object? _selection;
+    private IReadOnlyList<LogFileInfo> _inventory = [];
+    private bool _isDemo;
 
     public MainViewModel()
     {
@@ -78,16 +83,33 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public ObservableCollection<FileRow> Files { get; } = [];
-    public IReadOnlyList<string> KindFilters { get; } = ["All", "DES", "NTLMv1", "RC4"];
-    public IReadOnlyList<int> ThreadChoices { get; } = [1, 2, 3, 4];
+    public IReadOnlyList<string> KindFilters { get; } = ["All", .. Guidance.Order.Select(Guidance.Label)];
+
+    /// <summary>Files scanned in parallel. More helps on SSDs and network shares, a single HDD is usually fastest with 2 to 4.</summary>
+    public IReadOnlyList<int> ThreadChoices { get; } = [1, 2, 3, 4, 6, 8, 12, 16];
 
     public string Folder { get => _folder; private set { _folder = value; OnChanged(); OnChanged(nameof(HasFolder)); } }
     public bool HasFolder => _folder.Length > 0;
-    public bool Recurse { get => _recurse; set { _recurse = value; OnChanged(); } }
+
+    public bool Recurse
+    {
+        get => _recurse;
+        set
+        {
+            _recurse = value;
+            OnChanged();
+            // The file list depends on it, so read the folder again.
+            if (HasFolder && !_isDemo && !_isBusy) _ = OpenFolderAsync(_folder);
+        }
+    }
+
     public int Threads { get => _threads; set { _threads = value; OnChanged(); } }
 
-    public bool IsBusy { get => _isBusy; private set { _isBusy = value; OnChanged(); OnChanged(nameof(CanAct)); } }
+    public bool IsBusy { get => _isBusy; private set { _isBusy = value; OnChanged(); OnChanged(nameof(CanAct)); OnChanged(nameof(CanScan)); } }
     public bool CanAct => !_isBusy;
+    public int RelevantCount => _inventory.Count(f => f.IsRelevant);
+    public bool CanScan => !_isBusy && !_isDemo && RelevantCount > 0;
+    public string ScanButtonText => _result is null || _isDemo ? "Start scan" : "Scan again";
     public string StatusText { get => _statusText; private set { _statusText = value; OnChanged(); } }
     public double OverallProgress { get => _overall; private set { _overall = value; OnChanged(); } }
 
@@ -97,7 +119,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         private set
         {
             _result = value;
-            foreach (var n in new[] { nameof(Result), nameof(HasResult), nameof(DesCount), nameof(NtlmCount), nameof(Rc4Count), nameof(HeadlineText), nameof(TruncatedText), nameof(IsTruncated), nameof(ScopeText) })
+            foreach (var n in new[] { nameof(Result), nameof(HasResult), nameof(Tiles), nameof(HeadlineText), nameof(TruncatedText), nameof(IsTruncated), nameof(ScopeText), nameof(ScanButtonText) })
             {
                 OnChanged(n);
             }
@@ -105,9 +127,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     public bool HasResult => _result is not null;
-    public string DesCount => Compact(_result?.Count(LegacyKind.Des) ?? 0);
-    public string NtlmCount => Compact(_result?.Count(LegacyKind.Ntlmv1) ?? 0);
-    public string Rc4Count => Compact(_result?.Count(LegacyKind.Rc4) ?? 0);
+    public IReadOnlyList<KindTile> Tiles => Guidance.Order
+        .Select(k => new KindTile(k, Guidance.Label(k), Compact(_result?.Count(k) ?? 0)))
+        .ToList();
 
     /// <summary>Short numbers for the tiles: 950, 13.1k, 4.2M. The exact count is in the summary.</summary>
     public static string Compact(long n) => n switch
@@ -119,11 +141,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string ScopeText => _result?.Scope ?? "";
     public string HeadlineText => _result switch
     {
-        null => "Open a folder with archived .evtx files from your servers. The tool finds the Security and System logs and scans them.",
+        null when RelevantCount > 0 => $"{RelevantCount} {(RelevantCount == 1 ? "log is" : "logs are")} ready. Press Start scan when you are ready.",
+        null when HasFolder => "No Security, System or Directory Service logs in this folder.",
+        null => "Open a folder with archived .evtx files from your servers. The tool works out which log each file is, then you start the scan.",
         { Cancelled: true } => $"Scan cancelled. {_result.TotalHits:N0} events found so far.",
         { TotalHits: 0 } => _result.Files.Count(f => f.IsRelevant) is var n && n == 1
-            ? "No NTLMv1, RC4 or DES found in 1 log."
-            : $"No NTLMv1, RC4 or DES found in {_result.Files.Count(f => f.IsRelevant)} logs.",
+            ? "Nothing found in 1 log."
+            : $"Nothing found in {_result.Files.Count(f => f.IsRelevant)} logs.",
         _ => $"{_result.TotalHits:N0} events from {_result.Summary.Count:N0} account and client pairs, scanned in {(_result.Duration.TotalSeconds < 10 ? _result.Duration.TotalSeconds.ToString("0.#") : _result.Duration.TotalSeconds.ToString("0"))} s",
     };
     public bool IsTruncated => _result?.Truncated == true;
@@ -186,9 +210,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private static IEnumerable<DetailRow> Rows(params (string Label, string Value)[] rows) =>
         rows.Where(r => r.Value.Length > 0).Select(r => new DetailRow(r.Label, r.Value));
 
+    /// <summary>Reads the folder and works out which log each file is. Scanning starts only with <see cref="StartScanAsync"/>.</summary>
     public async Task OpenFolderAsync(string folder)
     {
         Folder = folder;
+        _isDemo = false;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
         IsBusy = true;
@@ -196,6 +222,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Selection = null;
         Events = [];
         Summary = [];
+        _inventory = [];
         Files.Clear();
         OnChanged(nameof(FilesHeader));
         SelectedTab = 2;
@@ -204,37 +231,63 @@ public sealed class MainViewModel : INotifyPropertyChanged
             StatusText = "Finding .evtx files and checking which log each one is…";
             OverallProgress = 0;
             var recurse = Recurse;
-            var inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, cancellationToken: token), token);
-            var rows = inventory.ToDictionary(f => f.Path, f => new FileRow(f, folder), StringComparer.OrdinalIgnoreCase);
-            foreach (var row in rows.Values) Files.Add(row);
+            var parallel = Math.Max(4, Threads);
+            _inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, maxParallel: parallel, cancellationToken: token), token);
+            foreach (var f in _inventory) Files.Add(new FileRow(f, folder));
+        }
+        catch (OperationCanceledException)
+        {
+            // The user cancelled the folder read.
+        }
+        finally
+        {
+            IsBusy = false;
+            StatusText = "";
             OnChanged(nameof(FilesHeader));
+            OnChanged(nameof(RelevantCount));
+            OnChanged(nameof(CanScan));
+            OnChanged(nameof(HeadlineText));
+        }
+    }
 
-            var relevant = inventory.Where(f => f.IsRelevant).ToList();
-            if (relevant.Count == 0)
-            {
-                StatusText = inventory.Count == 0 ? "No .evtx files in this folder." : "No readable Security or System logs in this folder.";
-                Result = new ScanResult(inventory, [], [], new Dictionary<string, FileProgress>(), 0, false, false, TimeSpan.Zero, folder);
-                return;
-            }
+    public async Task StartScanAsync()
+    {
+        if (!CanScan) return;
+        var folder = Folder;
+        _scanCts = new CancellationTokenSource();
+        var token = _scanCts.Token;
+        IsBusy = true;
+        Result = null;
+        Selection = null;
+        Events = [];
+        Summary = [];
+        SelectedTab = 2;
 
-            var totalBytes = Math.Max(1, relevant.Sum(f => f.Size));
+        // Fresh rows, so a second scan starts from a clean state.
+        Files.Clear();
+        var rows = _inventory.ToDictionary(f => f.Path, f => new FileRow(f, folder), StringComparer.OrdinalIgnoreCase);
+        foreach (var row in rows.Values) Files.Add(row);
+        var relevant = _inventory.Where(f => f.IsRelevant).ToList();
+        var totalBytes = Math.Max(1, relevant.Sum(f => f.Size));
+        try
+        {
+            OverallProgress = 0;
+            StatusText = $"Starting {relevant.Count} logs…";
             var progress = new Progress<FileProgress>(p =>
             {
                 if (rows.TryGetValue(p.Path, out var row)) row.Update(p);
-                var done = relevant.Sum(f => rows[f.Path] is var r && r.State is FileState.Done or FileState.Error or FileState.Cancelled
+                var done = relevant.Sum(f => rows[f.Path].State is FileState.Done or FileState.Error or FileState.Cancelled
                     ? f.Size
                     : (long)(f.Size * rows[f.Path].Percent / 100));
                 OverallProgress = 100.0 * done / totalBytes;
                 var finished = relevant.Count(f => rows[f.Path].State is FileState.Done or FileState.Error);
-                StatusText = $"Scanning {finished} of {relevant.Count} logs done · {Reports.SizeText(done)} of {Reports.SizeText(totalBytes)} · {rows.Values.Sum(r => r.Hits):N0} found";
+                var running = relevant.Count(f => rows[f.Path].State is FileState.Scanning);
+                StatusText = $"{finished} of {relevant.Count} logs done, {running} running · {Reports.SizeText(done)} of {Reports.SizeText(totalBytes)} · {rows.Values.Sum(r => r.Hits):N0} found";
             });
             var options = new ScanOptions(Threads);
+            var inventory = _inventory;
             var result = await Task.Run(() => Scanner.Scan(_reader, inventory, folder, options, progress, token));
             Show(result);
-        }
-        catch (OperationCanceledException)
-        {
-            StatusText = "Cancelled.";
         }
         finally
         {
@@ -251,6 +304,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         try
         {
             var result = await Task.Run(() => DemoData.Create(DateTime.Now));
+            _isDemo = true;
+            _inventory = result.Files;
             Folder = result.Scope;
             Files.Clear();
             foreach (var f in result.Files)
@@ -295,7 +350,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _searchCts?.Cancel();
         var cts = _searchCts = new CancellationTokenSource();
         var terms = _search.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        LegacyKind? kind = _kindFilter switch { "DES" => LegacyKind.Des, "NTLMv1" => LegacyKind.Ntlmv1, "RC4" => LegacyKind.Rc4, _ => null };
+        LegacyKind? kind = Guidance.Order.Where(k => Guidance.Label(k) == _kindFilter).Select(k => (LegacyKind?)k).FirstOrDefault();
         var source = _result;
         try
         {

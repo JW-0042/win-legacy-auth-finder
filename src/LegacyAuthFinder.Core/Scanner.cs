@@ -16,7 +16,7 @@ public static class Scanner
 
     /// <summary>Finds all .evtx files and works out which log each one belongs to.</summary>
     public static IReadOnlyList<LogFileInfo> Inventory(IEvtxReader reader, string folder, bool recurse,
-        IProgress<LogFileInfo>? progress = null, CancellationToken cancellationToken = default)
+        IProgress<LogFileInfo>? progress = null, int maxParallel = 4, CancellationToken cancellationToken = default)
     {
         var paths = Directory.EnumerateFiles(folder, "*.evtx", new EnumerationOptions
             {
@@ -27,7 +27,7 @@ public static class Scanner
             .Order(StringComparer.OrdinalIgnoreCase)
             .ToList();
         var result = new LogFileInfo[paths.Count];
-        Parallel.For(0, paths.Count, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken }, i =>
+        Parallel.For(0, paths.Count, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallel), CancellationToken = cancellationToken }, i =>
         {
             result[i] = reader.Inspect(paths[i]);
             progress?.Report(result[i]);
@@ -146,13 +146,8 @@ public static class Scanner
         return new ScanResult(files, events, rows, results, total, truncated, cancelled, clock.Elapsed, scope);
     }
 
-    /// <summary>Most severe first: DES, then NTLMv1, then RC4.</summary>
-    public static int KindOrder(LegacyKind kind) => kind switch
-    {
-        LegacyKind.Des => 0,
-        LegacyKind.Ntlmv1 => 1,
-        _ => 2,
-    };
+    /// <summary>Most urgent first, see <see cref="Guidance.Order"/>.</summary>
+    public static int KindOrder(LegacyKind kind) => Guidance.Order.ToList().IndexOf(kind);
 
     /// <summary>How far into the file the last match was. Records are read oldest first.</summary>
     internal static double? Percent(LogFileInfo file, long recordId)

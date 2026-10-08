@@ -18,8 +18,7 @@ internal sealed class FakeReader : IEvtxReader
         foreach (var e in Events.GetValueOrDefault(path) ?? [])
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var fits = query == Queries.Ntlmv1 ? e.EventId is 4624 or 4625 : query == Queries.Kerberos ? e.EventId is >= 4768 and <= 4770 : e.EventId is >= 201 and <= 209;
-            if (fits) yield return e;
+            if (DemoData.QueryOf(e) == query) yield return e;
         }
     }
 }
@@ -38,15 +37,32 @@ public class ScannerTests
             new Dictionary<string, string> { ["LmPackageName"] = "NTLM V1", ["TargetUserName"] = user, ["IpAddress"] = "10.0.0.7" });
 
     [Fact]
-    public void Only_security_and_system_logs_are_scanned()
+    public void Only_security_system_and_directory_service_logs_are_scanned()
     {
         var reader = new FakeReader();
-        LogFileInfo[] files = [File("a.evtx", "Security"), File("b.evtx", "System"), File("c.evtx", "Application"), File("d.evtx", "", "broken")];
+        LogFileInfo[] files =
+        [
+            File("a.evtx", "Security"), File("b.evtx", "System"), File("e.evtx", "Directory Service"),
+            File("c.evtx", "Application"), File("d.evtx", "", "broken"),
+        ];
         var r = Scanner.Scan(reader, files, "test", new ScanOptions());
         Assert.Equal(FileState.Skipped, r.FileResults["c.evtx"].State);
         Assert.Equal(FileState.Error, r.FileResults["d.evtx"].State);
-        Assert.Equal(["NTLMv1 logons", "RC4 and DES Kerberos tickets"], reader.Calls.Where(c => c.Path == "a.evtx").Select(c => c.Query));
-        Assert.Equal(["KDC RC4 warnings"], reader.Calls.Where(c => c.Path == "b.evtx").Select(c => c.Query));
+        Assert.Equal(["NTLMv1 logons", "RC4 and DES Kerberos tickets", "Kerberos encryption type failures"],
+            reader.Calls.Where(c => c.Path == "a.evtx").Select(c => c.Query));
+        Assert.Equal(["KDC RC4 warnings", "KDC encryption type errors"], reader.Calls.Where(c => c.Path == "b.evtx").Select(c => c.Query));
+        Assert.Equal(["LDAP signing and channel binding"], reader.Calls.Where(c => c.Path == "e.evtx").Select(c => c.Query));
+    }
+
+    [Fact]
+    public void Many_files_can_be_scanned_at_once()
+    {
+        var reader = new FakeReader();
+        var files = Enumerable.Range(0, 20).Select(i => File($"f{i}.evtx", "Security")).ToList();
+        foreach (var f in files) reader.Events[f.Path] = [Rc4("svc", "10.0.0.1", 1)];
+        var r = Scanner.Scan(reader, files, "test", new ScanOptions(Threads: 16));
+        Assert.Equal(20, r.TotalHits);
+        Assert.All(files, f => Assert.Equal(FileState.Done, r.FileResults[f.Path].State));
     }
 
     [Fact]
