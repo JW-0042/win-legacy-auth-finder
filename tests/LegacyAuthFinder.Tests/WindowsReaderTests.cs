@@ -136,16 +136,18 @@ public sealed class WindowsReaderTests(ITestOutputHelper output) : IDisposable
             Assert.Equal(full, sliced);
             Assert.True(full > 0);
 
-            // A cancelled scan must stop at the next slice instead of waiting for the end of the file.
-            // A tiny log (CI runners) finishes inside the first slice, so there is nothing to interrupt there.
-            if (alive == 0)
-            {
-                output.WriteLine("Log too small for an empty slice, cancel check skipped.");
-                return;
-            }
+            // A cancelled scan must stop early: at the next empty slice, or at the next record when the log is so
+            // small that no slice expires (CI runners). Either way, it must not read on to the end of the file.
             using var cts = new CancellationTokenSource();
+            var seen = 0;
             Assert.Throws<OperationCanceledException>(() =>
-                _reader.Read(system, query, cts.Token, () => cts.Cancel()).Count());
+            {
+                foreach (var _ in _reader.Read(system, query, cts.Token, () => cts.Cancel()))
+                {
+                    if (++seen == 1) cts.Cancel();
+                }
+            });
+            Assert.True(seen < full, $"read {seen} of {full} records after cancel");
         }
         finally
         {
