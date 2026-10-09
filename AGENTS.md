@@ -33,6 +33,13 @@ LegacyAuthFinder.exe --screenshot docs/screenshot-files-light.png --theme light 
 
 `--folder <path>` in screenshot mode scans a real folder instead of the demo (add `--no-scan` to stop after the file list). It is for local testing only and must never be used for images that get published.
 
+## Reading files
+
+- `WindowsEvtxReader.Read` reads in slices (`ReadSlice`, half a second). An expired slice is an `EventLogException` whose message equals the Win32 ERROR_TIMEOUT message. Keep that loop: without it a file without findings is one blocking call that ignores cancellation.
+- Do not split a file into EventRecordID ranges to show progress. The service scans the whole file for every range, measured 16 times slower.
+- Exported logs keep their original record IDs. Progress must use `FirstRecordId` and `LastRecordId` from `Inspect`, not `OldestRecordNumber`.
+- `Storage.Detect` picks the number of files scanned at once. Keep the hard disk default at 2.
+
 ## Event data without names
 
 Older events (KDC 14/16/26/27, Directory Service 2887/2889/30xx) have unnamed insertion strings. Their queries use `Positional: true` and the classifier reads them with `RawEvent.At(index)`. The order is taken from Microsoft's documented message text. Keep the comments in `Classifier` in sync when you change it.

@@ -1,3 +1,4 @@
+using System.Diagnostics.Eventing.Reader;
 using System.Diagnostics;
 using LegacyAuthFinder.Core;
 using Xunit.Abstractions;
@@ -105,6 +106,61 @@ public sealed class WindowsReaderTests(ITestOutputHelper output) : IDisposable
         var mbPerSecond = info.Size / 1_048_576.0 / Math.Max(clock.Elapsed.TotalSeconds, 0.001);
         output.WriteLine($"{info.Size / 1_048_576.0:0.0} MB, {info.RecordCount} records in {clock.ElapsedMilliseconds} ms ({mbPerSecond:0} MB/s)");
         Assert.Equal(FileState.Done, result.FileResults[system].State);
+    }
+
+    [Fact]
+    public void Inventory_records_the_real_record_id_range()
+    {
+        var system = Export("System", "ids.evtx")!;
+        var info = _reader.Inspect(system);
+        Assert.True(info.FirstRecordId > 0);
+        Assert.True(info.LastRecordId >= info.FirstRecordId);
+        output.WriteLine($"records {info.FirstRecordId} to {info.LastRecordId}, oldest reported as {info.OldestRecordNumber}");
+    }
+
+    [Fact]
+    public void Reading_in_slices_keeps_every_record_and_stays_cancellable()
+    {
+        var system = Export("System", "slices.evtx")!;
+        var info = _reader.Inspect(system);
+        // Only the last 200 records match, so the API scans most of the file before the first result.
+        var query = new EvtxQuery("tail", "System", $"*[System[EventRecordID>={info.LastRecordId - 199}]]", null, Positional: true);
+        var full = _reader.Read(system, query, CancellationToken.None).Count();
+        var old = WindowsEvtxReader.ReadSlice;
+        try
+        {
+            WindowsEvtxReader.ReadSlice = TimeSpan.FromMilliseconds(1);
+            var alive = 0;
+            var sliced = _reader.Read(system, query, CancellationToken.None, () => alive++).Count();
+            output.WriteLine($"{full} records, {alive} empty slices");
+            Assert.Equal(full, sliced);
+            Assert.True(full > 0);
+
+            // A cancelled scan must stop at the next slice instead of waiting for the end of the file.
+            using var cts = new CancellationTokenSource();
+            Assert.Throws<OperationCanceledException>(() =>
+                _reader.Read(system, query, cts.Token, () => cts.Cancel()).Count());
+        }
+        finally
+        {
+            WindowsEvtxReader.ReadSlice = old;
+        }
+    }
+
+    [Fact]
+    public void Other_errors_are_not_mistaken_for_a_timeout()
+    {
+        // The positive case is covered by Reading_in_slices_keeps_every_record_and_stays_cancellable, which counts
+        // real expired slices. EventLogException builds its message from the Win32 code, so it cannot be faked here.
+        Assert.False(WindowsEvtxReader.IsTimeout(new EventLogException("The event log file is corrupted.")));
+    }
+
+    [Fact]
+    public void Storage_of_the_temp_folder_is_detected()
+    {
+        var kind = Storage.Detect(_dir);
+        output.WriteLine($"{_dir}: {kind}, recommended {Storage.RecommendedThreads(kind)} files at once");
+        Assert.NotEqual(StorageKind.Network, kind);
     }
 
     [Fact]

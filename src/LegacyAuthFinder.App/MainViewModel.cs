@@ -89,6 +89,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private object? _selection;
     private IReadOnlyList<LogFileInfo> _inventory = [];
     private bool _isDemo;
+    private StorageKind _storage = StorageKind.Unknown;
+    private int _recommended = 4;
 
     public MainViewModel()
     {
@@ -124,7 +126,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    public int Threads { get => _threads; set { _threads = value; OnChanged(); } }
+    public int Threads { get => _threads; set { _threads = value; OnChanged(); OnChanged(nameof(StorageText)); } }
+
+    /// <summary>What kind of disk the folder is on and whether the chosen number of files fits it.</summary>
+    public string StorageText => !HasFolder || _isDemo
+        ? "SSD: up to 8 files at once. One hard disk or a network share: 2. The right number is set when you open a folder."
+        : _threads > _recommended && _storage is StorageKind.Hdd or StorageKind.Network
+            ? $"{Storage.Describe(_storage)} You chose {_threads}, so the scan will likely be slower than with {_recommended}."
+            : Storage.Describe(_storage);
 
     public bool IsBusy { get => _isBusy; private set { _isBusy = value; OnChanged(); OnChanged(nameof(CanAct)); OnChanged(nameof(CanScan)); } }
     public bool CanAct => !_isBusy;
@@ -251,6 +260,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             StatusText = "Finding .evtx files and checking which log each one is…";
             OverallProgress = 0;
+            _storage = await Task.Run(() => Storage.Detect(folder), token);
+            _recommended = Storage.RecommendedThreads(_storage);
+            Threads = ThreadChoices.Contains(_recommended) ? _recommended : 4;
             var recurse = Recurse;
             var parallel = Math.Max(4, Threads);
             _inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, maxParallel: parallel, cancellationToken: token), token);
@@ -268,6 +280,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             OnChanged(nameof(RelevantCount));
             OnChanged(nameof(CanScan));
             OnChanged(nameof(HeadlineText));
+            OnChanged(nameof(StorageText));
         }
     }
 

@@ -81,9 +81,15 @@ public static class Scanner
         var cancelled = false;
         try
         {
+            // The workers block in the event log API. Make sure the thread pool has them ready instead of adding
+            // one blocked thread per second, which looked like files that never start.
+            var threads = Math.Max(1, options.Threads);
+            ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
+            if (minWorkers < threads + 2) ThreadPool.SetMinThreads(threads + 2, minIo);
+
             // NoBuffering: a worker takes exactly one file at a time, so a waiting file starts as soon as any slot is free.
             var source = Partitioner.Create(relevant, EnumerablePartitionerOptions.NoBuffering);
-            var parallel = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, options.Threads), CancellationToken = cancellationToken };
+            var parallel = new ParallelOptions { MaxDegreeOfParallelism = threads, CancellationToken = cancellationToken };
             Parallel.ForEach(source, parallel, file =>
             {
                 Report(new FileProgress(file.Path, FileState.Scanning, 0, 0, "Scanning"));
@@ -95,7 +101,16 @@ public static class Scanner
                 {
                     foreach (var query in Queries.For(file.Channel))
                     {
-                        foreach (var raw in reader.Read(file.Path, query, cancellationToken))
+                        var currentQuery = query;
+                        void Alive()
+                        {
+                            if (lastReport.Elapsed <= ProgressInterval) return;
+                            Report(new FileProgress(file.Path, FileState.Scanning, hits, null,
+                                hits == 0 ? $"{currentQuery.Name}: reading, nothing matched yet" : $"{currentQuery.Name}: reading, {hits:N0} found so far"));
+                            lastReport.Restart();
+                        }
+
+                        foreach (var raw in reader.Read(file.Path, query, cancellationToken, Alive))
                         {
                             var e = Classifier.Classify(raw, file.Name, pool);
                             if (e is null) continue;
@@ -146,11 +161,21 @@ public static class Scanner
     /// <summary>Most urgent first, see <see cref="Guidance.Order"/>.</summary>
     public static int KindOrder(LegacyKind kind) => Guidance.Order.ToList().IndexOf(kind);
 
-    /// <summary>How far into the file the last match was. Records are read oldest first.</summary>
+    /// <summary>
+    /// How far into the file the last match was. Records are read oldest first. Uses the real first and last record
+    /// IDs, because exported logs keep their original numbering and do not start at 1.
+    /// </summary>
     internal static double? Percent(LogFileInfo file, long recordId)
     {
-        if (file.RecordCount <= 0 || recordId <= 0) return null;
-        var done = (double)(recordId - file.OldestRecordNumber + 1) / file.RecordCount;
+        if (recordId <= 0) return null;
+        long first = file.FirstRecordId, last = file.LastRecordId;
+        if (first <= 0 || last < first)
+        {
+            if (file.RecordCount <= 0) return null;
+            first = file.OldestRecordNumber;
+            last = first + file.RecordCount - 1;
+        }
+        var done = (double)(recordId - first + 1) / (last - first + 1);
         return Math.Clamp(done, 0, 1);
     }
 }

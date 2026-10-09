@@ -10,7 +10,7 @@ const string Usage = "Usage: legacy-auth-scan <folder> [--no-recurse] [--threads
 
 string? folder = null, eventsCsv = null, summaryCsv = null, jsonPath = null, htmlPath = null;
 bool recurse = true, quiet = false, demo = false;
-var threads = 2;
+int? threads = null;
 for (var i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -50,6 +50,8 @@ else
     }
 
     var reader = new WindowsEvtxReader();
+    var storage = Storage.Detect(folder);
+    threads ??= Storage.RecommendedThreads(storage);
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
@@ -57,6 +59,7 @@ else
     if (!quiet)
     {
         Console.WriteLine($"Legacy Auth Finder · {Path.GetFullPath(folder)} · {files.Count} .evtx files");
+        Console.WriteLine($"{Storage.Describe(storage)} Scanning {threads} at once.");
         foreach (var f in files)
         {
             Console.WriteLine($"  {f.Name,-48} {(f.Error is null ? f.Channel : "unreadable"),-12} {Reports.SizeText(f.Size),10}  {f.Computer}");
@@ -76,7 +79,7 @@ else
             Console.WriteLine($"  {Path.GetFileName(p.Path),-48} {p.State,-10} {p.Message}");
         }
     });
-    result = Scanner.Scan(reader, files, Path.GetFullPath(folder), new ScanOptions(threads), progress, cts.Token);
+    result = Scanner.Scan(reader, files, Path.GetFullPath(folder), new ScanOptions(threads.Value), progress, cts.Token);
 }
 
 if (!quiet)

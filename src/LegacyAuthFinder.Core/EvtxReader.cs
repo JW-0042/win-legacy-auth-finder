@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics.Eventing.Reader;
 using System.Globalization;
 using System.Security.Principal;
@@ -17,7 +18,8 @@ public interface IEvtxReader
 {
     LogFileInfo Inspect(string path);
 
-    IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken);
+    /// <param name="alive">Called now and then while the file is being read but nothing has matched yet.</param>
+    IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null);
 }
 
 public static class Queries
@@ -91,9 +93,10 @@ public sealed class WindowsEvtxReader : IEvtxReader
         try
         {
             var info = EventLogSession.GlobalSession.GetLogInformation(path, PathType.FilePath);
-            var (channel, computer, first) = Edge(path, reverse: false);
-            var (_, _, last) = Edge(path, reverse: true);
-            return new LogFileInfo(path, size, channel ?? "(empty)", computer ?? "", info.RecordCount ?? 0, info.OldestRecordNumber ?? 0, first, last);
+            var (channel, computer, first, firstId) = Edge(path, reverse: false);
+            var (_, _, last, lastId) = Edge(path, reverse: true);
+            return new LogFileInfo(path, size, channel ?? "(empty)", computer ?? "", info.RecordCount ?? 0, info.OldestRecordNumber ?? 0, first, last,
+                FirstRecordId: firstId, LastRecordId: lastId);
         }
         catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException)
         {
@@ -101,14 +104,27 @@ public sealed class WindowsEvtxReader : IEvtxReader
         }
     }
 
-    private static (string? Channel, string? Computer, DateTime? Time) Edge(string path, bool reverse)
+    // Exported and archived logs keep their original record IDs, so the first ID is rarely 1.
+    private static (string? Channel, string? Computer, DateTime? Time, long RecordId) Edge(string path, bool reverse)
     {
         using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, "*") { ReverseDirection = reverse });
         using var record = reader.ReadEvent();
-        return record is null ? (null, null, null) : (record.LogName, record.MachineName, record.TimeCreated);
+        return record is null ? (null, null, null, 0) : (record.LogName, record.MachineName, record.TimeCreated, record.RecordId ?? 0);
     }
 
-    public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
+    /// <summary>
+    /// How long one read may run before it comes back without a result. The event log service scans the whole file
+    /// for the next match, so without this a file with no findings is one long blocking call that cannot be cancelled.
+    /// </summary>
+    internal static TimeSpan ReadSlice { get; set; } = TimeSpan.FromMilliseconds(500);
+
+    private static readonly string TimeoutMessage = new Win32Exception(ErrorTimeout).Message;
+    private const int ErrorTimeout = 1460;
+
+    /// <summary>The API reports an expired read slice as a generic exception, so it is told apart by its message.</summary>
+    internal static bool IsTimeout(EventLogException ex) => ex.Message == TimeoutMessage;
+
+    public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null)
     {
         using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, query.XPath));
         using var selector = query.Fields is null
@@ -117,7 +133,17 @@ public sealed class WindowsEvtxReader : IEvtxReader
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var record = reader.ReadEvent();
+            EventRecord? record;
+            try
+            {
+                record = reader.ReadEvent(ReadSlice);
+            }
+            catch (EventLogException ex) when (IsTimeout(ex))
+            {
+                alive?.Invoke();
+                continue;
+            }
+            using var _ = record;
             if (record is null) yield break;
             Dictionary<string, string> data;
             IReadOnlyList<string>? values = null;

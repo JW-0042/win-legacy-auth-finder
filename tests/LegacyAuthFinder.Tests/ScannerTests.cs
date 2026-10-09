@@ -11,7 +11,7 @@ internal sealed class FakeReader : IEvtxReader
 
     public LogFileInfo Inspect(string path) => throw new NotSupportedException();
 
-    public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
+    public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null)
     {
         lock (Calls) Calls.Add((path, query.Name));
         if (Throws.TryGetValue(path, out var ex)) throw ex;
@@ -122,12 +122,26 @@ public class ScannerTests
     }
 
     [Fact]
-    public void Progress_is_estimated_from_the_record_number()
+    public void Progress_is_estimated_from_the_real_record_ids()
     {
-        var file = new LogFileInfo("a.evtx", 1, "Security", "", 1000, 501, null, null);
-        Assert.Equal(0.5, Scanner.Percent(file, 1000));
-        Assert.Null(Scanner.Percent(file with { RecordCount = 0 }, 10));
+        // An exported log: 1000 records numbered 79335 to 80334, while the file itself reports oldest = 1.
+        var file = new LogFileInfo("a.evtx", 1, "Security", "", 1000, 1, null, null, FirstRecordId: 79335, LastRecordId: 80334);
+        Assert.Equal(0.5, Scanner.Percent(file, 79834)!.Value, 3);
+        Assert.Equal(1.0, Scanner.Percent(file, 80334)!.Value, 3);
+        // Without record IDs the old estimate is used.
+        var plain = new LogFileInfo("b.evtx", 1, "Security", "", 1000, 501, null, null);
+        Assert.Equal(0.5, Scanner.Percent(plain, 1000));
+        Assert.Null(Scanner.Percent(plain with { RecordCount = 0 }, 10));
     }
+
+    [Theory]
+    [InlineData(StorageKind.Hdd, 2)]
+    [InlineData(StorageKind.Network, 2)]
+    [InlineData(StorageKind.Unknown, 4)]
+    public void Recommended_threads_follow_the_disk(StorageKind kind, int expected) => Assert.Equal(expected, Storage.RecommendedThreads(kind));
+
+    [Fact]
+    public void Recommended_threads_on_ssd_stay_between_2_and_8() => Assert.InRange(Storage.RecommendedThreads(StorageKind.Ssd), 2, 8);
 
     [Fact]
     public void Demo_covers_every_kind_and_file_state()

@@ -52,6 +52,19 @@ Two usability changes came from real use: opening a folder no longer starts the 
 
 These older events have no field names, only numbered insertion strings. Their order comes from the message text Microsoft documents, and an integration test checks that positional reading returns real values in the right order.
 
+## Version 0.2.2: a scan that looked stuck
+
+With 16 files at once and 19 archives, the scan seemed to stand still, and after Cancel the running files finished one by one while the waiting ones never started. With 2 or 4 files at once everything was fine. Reproducing it on an SSD did not work, so I looked at what the Windows API actually does.
+
+The answer was in the API, not in the tool's threads. A query asks the event log service for the next matching record. In a file with no findings that is one call that scans the whole file, blocks until the end and cannot be interrupted. Sixteen such calls on one hard disk make the disk seek between sixteen files, so each one crawls, and nothing on screen changes because nothing matches. Cancel only takes effect when a call returns, which is why the files finished one after another.
+
+Three things fixed it:
+- Reads now use a half second limit and resume where they stopped. I tested that no record is lost. Cancel takes effect within a second, and a file without findings shows that it is still being read.
+- The tool checks whether the folder is on an SSD, a hard disk or a network share (no admin rights needed) and picks the number of files to scan at once. On one hard disk that is 2.
+- The progress of a file was wrong for exported logs, because their record numbers do not start at 1. It now uses the real first and last record IDs.
+
+I also tried splitting a file into ranges of record IDs to get real progress. The API scans the whole file for every range, so 20 ranges were 16 times slower than one query. That idea went into the documentation as a dead end instead of into the code.
+
 ## Quality gates
 
 - The build treats warnings as errors.

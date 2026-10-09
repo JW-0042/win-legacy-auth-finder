@@ -194,7 +194,7 @@ public static class DemoData
 
         public LogFileInfo Inspect(string path) => Files.First(f => f.Path == path);
 
-        public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
+        public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null)
         {
             if (!_events.TryGetValue(path, out var list)) yield break;
             foreach (var e in list.OrderBy(e => e.Time))

@@ -24,7 +24,9 @@ public sealed record LogFileInfo(
     long OldestRecordNumber,
     DateTime? First,
     DateTime? Last,
-    string? Error = null)
+    string? Error = null,
+    long FirstRecordId = 0,
+    long LastRecordId = 0)
 {
     public string Name => System.IO.Path.GetFileName(Path);
 

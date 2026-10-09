@@ -53,13 +53,14 @@ Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAva
 ## How it works
 
 1. **Inventory.** When you open a folder, every `.evtx` file in it and its subfolders is opened and its first record tells which log it belongs to. File names like `Archive-Security-...` are not trusted. Unreadable or damaged files are listed with the reason. Nothing is scanned yet, so you can check the file list first.
-2. **Scan.** Press Start scan. Security, System and Directory Service logs are scanned with XPath filters that run inside the Windows event log API. A 4 GB file is streamed, never loaded into memory, and only matching records reach the tool. Up to 16 files are scanned in parallel: 8 or more pays off on SSDs and network shares, while a single hard disk is usually fastest with 2 to 4.
-3. **Results.**
+2. **Scan.** Press Start scan. Security, System and Directory Service logs are scanned with XPath filters that run inside the Windows event log API. A 4 GB file is streamed, never loaded into memory, and only matching records reach the tool. Reads come back every half second even when nothing matches, so Cancel stops within a second and each file shows how long it has been read.
+3. **Files at once.** When you open a folder, the tool checks what kind of disk it is on and picks the number of files to scan in parallel: up to 8 on an SSD, 2 on a hard disk or a network share. You can change it, but on one hard disk more files at once make the disk seek between them and the whole scan slower.
+4. **Results.**
    - **Who uses it** groups the events by type, account, client and service, with counts and first and last seen. This is your to-do list.
    - **Events** lists every single event and is searchable.
    - **Files** shows the detected log, the computer, the time range and the result of each file.
 
-On a normal disk the scan runs at roughly 100 MB per second per file. A 4 GB archive takes well under a minute. Very large results are handled too: the event list keeps the first 5 million events, and the summary and totals always count all of them.
+On an SSD the scan runs at roughly 100 MB per second per file, so a 4 GB archive takes well under a minute. A hard disk or a network share is slower and the number of files at once matters more than anything else. Very large results are handled too: the event list keeps the first 2 million events, and the summary and totals always count all of them.
 
 ## Searching
 

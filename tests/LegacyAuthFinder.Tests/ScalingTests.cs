@@ -11,7 +11,7 @@ public sealed class ScalingTests(ITestOutputHelper output)
     {
         public LogFileInfo Inspect(string path) => throw new NotSupportedException();
 
-        public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken)
+        public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null)
         {
             if (query != Queries.Kerberos) yield break;
             var start = new DateTime(2026, 9, 1);
