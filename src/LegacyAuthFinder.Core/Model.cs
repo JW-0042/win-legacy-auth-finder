@@ -12,6 +12,10 @@ public enum LegacyKind
     LdapChannelBinding,
     /// <summary>Kerberos requests that failed because no common encryption type was found (KDC 14/16/26/27, status 0xE).</summary>
     EtypeFailure,
+    /// <summary>A client connected with SMB version 1 (SMBServer Audit 3000).</summary>
+    Smb1,
+    /// <summary>Any NTLM authentication from the NTLM Operational log (4020 to 4023, 4030 to 4033, 8001 to 8004).</summary>
+    Ntlm,
 }
 
 /// <summary>One .evtx file found in the folder, before it is scanned.</summary>
@@ -30,8 +34,8 @@ public sealed record LogFileInfo(
 {
     public string Name => System.IO.Path.GetFileName(Path);
 
-    /// <summary>Only Security, System and Directory Service logs can contain the events this tool looks for.</summary>
-    public bool IsRelevant => Error is null && Channel is Channels.Security or Channels.System or Channels.DirectoryService;
+    /// <summary>Only these logs can contain the events this tool looks for, see <see cref="Channels.Scanned"/>.</summary>
+    public bool IsRelevant => Error is null && Channels.Scanned.Contains(Channel);
 }
 
 public static class Channels
@@ -39,6 +43,21 @@ public static class Channels
     public const string Security = "Security";
     public const string System = "System";
     public const string DirectoryService = "Directory Service";
+    public const string NtlmOperational = "Microsoft-Windows-NTLM/Operational";
+    public const string SmbServerAudit = "Microsoft-Windows-SMBServer/Audit";
+
+    public static IReadOnlySet<string> Scanned { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        Security, System, DirectoryService, NtlmOperational, SmbServerAudit,
+    };
+
+    /// <summary>Short name for the file list.</summary>
+    public static string Short(string channel) => channel switch
+    {
+        NtlmOperational => "NTLM",
+        SmbServerAudit => "SMB Audit",
+        _ => channel,
+    };
 }
 
 /// <summary>
@@ -208,5 +227,10 @@ public sealed record ScanResult(
     TimeSpan Duration,
     string Scope)
 {
+    private IReadOnlyList<FixItem>? _fixes;
+
     public long Count(LegacyKind kind) => Summary.Where(s => s.Kind == kind).Sum(s => s.Count);
+
+    /// <summary>The summary turned into things to fix, most urgent first.</summary>
+    public IReadOnlyList<FixItem> Fixes => _fixes ??= Remediation.Build(Summary);
 }

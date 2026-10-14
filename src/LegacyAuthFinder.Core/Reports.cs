@@ -40,6 +40,19 @@ public static class Reports
         }
     }
 
+    public static void WriteFixesCsv(TextWriter w, IEnumerable<FixItem> items)
+    {
+        w.WriteLine("Rank,Type,FixOn,Target,Problem,Action,Events,FirstSeen,LastSeen,Accounts,Clients,Services,LoggedOn");
+        foreach (var f in items)
+        {
+            w.WriteLine(string.Join(',',
+                f.Rank.ToString(CultureInfo.InvariantCulture), f.KindLabel, Csv(f.TargetTypeText), Csv(f.Target), Csv(f.Problem), Csv(f.Action),
+                f.Events.ToString(CultureInfo.InvariantCulture), f.FirstSeen.ToString(TimeFormat, CultureInfo.InvariantCulture),
+                f.LastSeen.ToString(TimeFormat, CultureInfo.InvariantCulture), Csv(string.Join(" ", f.Accounts)), Csv(string.Join(" ", f.Clients)),
+                Csv(string.Join(" ", f.Services)), Csv(string.Join(" ", f.Computers))));
+        }
+    }
+
     /// <summary>Quotes a CSV field when needed and defuses values that spreadsheet apps would run as formulas.</summary>
     public static string Csv(string value)
     {
@@ -68,6 +81,8 @@ public static class Reports
             ldapUnsigned = r.Count(LegacyKind.LdapSigning),
             ldapChannelBinding = r.Count(LegacyKind.LdapChannelBinding),
             etypeErrors = r.Count(LegacyKind.EtypeFailure),
+            smb1 = r.Count(LegacyKind.Smb1),
+            ntlm = r.Count(LegacyKind.Ntlm),
             all = r.TotalHits,
         },
         files = r.Files.Select(f => new
@@ -82,6 +97,22 @@ public static class Reports
             state = r.FileResults.TryGetValue(f.Path, out var p) ? p.State.ToString() : "",
             found = p?.Hits ?? 0,
             message = p?.Message ?? f.Error,
+        }),
+        fixes = r.Fixes.Select(f => new
+        {
+            rank = f.Rank,
+            type = f.KindLabel,
+            fixOn = f.TargetTypeText,
+            target = f.Target,
+            problem = f.Problem,
+            action = f.Action,
+            events = f.Events,
+            firstSeen = f.FirstSeen,
+            lastSeen = f.LastSeen,
+            accounts = f.Accounts,
+            clients = f.Clients,
+            services = f.Services,
+            computers = f.Computers,
         }),
         summary = r.Summary.Select(s => new
         {
@@ -107,7 +138,7 @@ public static class Reports
         sb.Append("h1{margin:0 0 4px}.meta{color:#5b6470;margin:0 0 24px}.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}");
         sb.Append(".tile{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:12px 16px;min-width:130px}.tile b{display:block;font-size:24px}");
         sb.Append("table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e1e4e8;margin-bottom:24px;font-size:13px}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid #eef0f2;vertical-align:top}");
-        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.Des{color:#b0124f}.Ntlmv1{color:#d93025}.Rc4{color:#c25e00}.LdapSigning{color:#7c3aed}.LdapChannelBinding{color:#0e7490}.EtypeFailure{color:#2f6fd6}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
+        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.Des{color:#b0124f}.Ntlmv1{color:#d93025}.Rc4{color:#c25e00}.LdapSigning{color:#7c3aed}.LdapChannelBinding{color:#0e7490}.EtypeFailure{color:#2f6fd6}.Smb1{color:#9a3412}.Ntlm{color:#4b5b6e}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
         sb.Append($"<h1>Legacy authentication report</h1><p class=\"meta\">{E(r.Scope)} · {r.Files.Count} files · {r.Duration.TotalMinutes:0.#} minutes{(r.Cancelled ? " · scan was cancelled, results are incomplete" : "")}</p>");
         sb.Append("<div class=\"tiles\">");
         foreach (var kind in Guidance.Order)
@@ -120,6 +151,17 @@ public static class Reports
         {
             var g = Guidance.For(kind);
             sb.Append($"<div class=\"g\"><b class=\"{kind}\">{E(g.Label)}</b><p>{E(g.Risk)}</p><p><b>What to do:</b> {E(g.Fix)}</p></div>");
+        }
+
+        if (r.Fixes.Count > 0)
+        {
+            sb.Append("<h2>What to fix first</h2><table><tr><th>#</th><th>Type</th><th>Fix on</th><th>Target</th><th>Problem</th><th>What to do</th><th>Events</th><th>Last seen</th></tr>");
+            foreach (var f in r.Fixes.Take(HtmlSummaryRows))
+            {
+                sb.Append($"<tr><td>{f.Rank}</td><td class=\"k {f.Kind}\">{f.KindLabel}</td><td>{E(f.TargetTypeText)}</td><td>{E(f.Target)}</td><td>{E(f.Problem)}</td><td>{E(f.Action)}</td><td>{f.Events:N0}</td><td>{f.LastSeen:yyyy-MM-dd HH:mm}</td></tr>");
+            }
+            sb.Append("</table>");
+            if (r.Fixes.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Fixes.Count} items. Export the fix list as CSV for the full list.</p>");
         }
 
         sb.Append($"<h2>Who still uses it</h2><table><tr><th>Type</th><th>Account</th><th>Client</th><th>Service</th><th>Count</th><th>First seen</th><th>Last seen</th><th>Logged on</th></tr>");

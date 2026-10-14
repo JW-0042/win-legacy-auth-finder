@@ -8,6 +8,8 @@ namespace LegacyAuthFinder.App;
 
 public partial class App : Application
 {
+    private Core.DiagLog? _log;
+
     // LegacyAuthFinder.exe [--demo | <folder>]
     // LegacyAuthFinder.exe --screenshot <file.png> [--theme light|dark] [--tab summary|events|files]
     // Screenshot mode loads the demo data, renders the main window to a PNG and exits. Used for the README.
@@ -22,10 +24,17 @@ public partial class App : Application
         base.OnStartup(e);
         if (i < 0 || i + 1 >= args.Length)
         {
+            // One diagnostic log per session. Unhandled errors end up there too.
+            var log = Core.DiagLog.Create("GUI");
+            _log = log;
+            DispatcherUnhandledException += (_, ex) => log.Error("CRASH", "UI thread", ex.Exception);
+            AppDomain.CurrentDomain.UnhandledException += (_, ex) => { if (ex.ExceptionObject is Exception x) log.Error("CRASH", "unhandled", x); };
+            TaskScheduler.UnobservedTaskException += (_, ex) => log.Error("CRASH", "unobserved task", ex.Exception);
             var window = new MainWindow();
             MainWindow = window;
             window.Show();
             var vmStart = (MainViewModel)window.DataContext;
+            vmStart.AttachLog(log);
             if (args.Contains("--demo")) await vmStart.LoadDemoAsync();
             else if (args.Length > 0 && Directory.Exists(args[0])) await vmStart.OpenFolderAsync(args[0]);
             return;
@@ -42,6 +51,13 @@ public partial class App : Application
             File.WriteAllText(path + ".error.txt", ex.ToString());
             Shutdown(1);
         }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _log?.Write("END", $"Application closed (exit code {e.ApplicationExitCode})");
+        _log?.Dispose();
+        base.OnExit(e);
     }
 
     private async Task RenderScreenshotAsync(string[] args, string path)
@@ -68,17 +84,25 @@ public partial class App : Application
         var tab = Array.IndexOf(args, "--tab") is var ti && ti >= 0 && ti + 1 < args.Length ? args[ti + 1] : "summary";
         if (tab == "events")
         {
-            vm.SelectedTab = 1;
+            vm.SelectedTab = 2;
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
             var grid = (System.Windows.Controls.DataGrid)window.FindName("EventsGrid");
             grid.SelectedItem = vm.Events.FirstOrDefault(e => e.EventId == 4769 && e.SessionEncryption.Length > 0 && e.Kind == Core.LegacyKind.Rc4);
         }
         else if (tab == "files")
         {
-            vm.SelectedTab = 2;
+            vm.SelectedTab = 3;
+        }
+        else if (tab == "fix")
+        {
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            var grid = (System.Windows.Controls.DataGrid)window.FindName("FixGrid");
+            grid.SelectedItem = vm.Fixes.FirstOrDefault(f => f.TargetType == Core.FixTarget.ServiceAccount) ?? vm.Fixes.FirstOrDefault();
         }
         else
         {
+            vm.SelectedTab = 1;
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
             // An RC4 service account is the most common real finding, so open on it unless asked for another row.
             var grid = (System.Windows.Controls.DataGrid)window.FindName("SummaryGrid");
             grid.SelectedItem = vm.Summary.FirstOrDefault(s => s.Account.StartsWith("svc-erp")) ?? vm.Summary.FirstOrDefault();

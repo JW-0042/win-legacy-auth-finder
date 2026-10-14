@@ -12,7 +12,8 @@ public static class Guidance
     /// <summary>Display order, most urgent first.</summary>
     public static IReadOnlyList<LegacyKind> Order { get; } =
     [
-        LegacyKind.Des, LegacyKind.Ntlmv1, LegacyKind.LdapSigning, LegacyKind.Rc4, LegacyKind.LdapChannelBinding, LegacyKind.EtypeFailure,
+        LegacyKind.Des, LegacyKind.Ntlmv1, LegacyKind.Smb1, LegacyKind.LdapSigning, LegacyKind.Rc4, LegacyKind.LdapChannelBinding,
+        LegacyKind.EtypeFailure, LegacyKind.Ntlm,
     ];
 
     public static string Label(LegacyKind kind) => kind switch
@@ -22,6 +23,8 @@ public static class Guidance
         LegacyKind.Des => "DES",
         LegacyKind.LdapSigning => "LDAP unsigned",
         LegacyKind.LdapChannelBinding => "LDAP CBT",
+        LegacyKind.Smb1 => "SMBv1",
+        LegacyKind.Ntlm => "NTLM",
         _ => "Etype error",
     };
 
@@ -29,10 +32,11 @@ public static class Guidance
     {
         [LegacyKind.Ntlmv1] = new(
             "NTLMv1",
-            "A logon used the NTLMv1 or LM challenge response. Windows records this in the \"Package Name (NTLM only)\" field of events 4624 and 4625.",
+            "A logon used the NTLMv1 or LM challenge response. Windows records this in the \"Package Name (NTLM only)\" field of events 4624 and 4625, and as NTLM version 1 in the enhanced NTLM events 4021, 4023, 4031 and 4033. Events 4024 and 4025 show single sign-on with NTLMv1-derived credentials, for example Wi-Fi, wired or VPN profiles with MS-CHAPv2.",
             "NTLMv1 and LM responses can be cracked quickly and relayed to other servers. One old client is enough to expose the password of every account that signs in from it.",
-            "Find the client in the summary and update or reconfigure it to use NTLMv2 or Kerberos. When no NTLMv1 is left, set \"Network security: LAN Manager authentication level\" to \"Send NTLMv2 response only. Refuse LM & NTLM\" on servers and domain controllers.",
+            "Find the client in the summary and update or reconfigure it to use NTLMv2 or Kerberos. When no NTLMv1 is left, set \"Network security: LAN Manager authentication level\" to \"Send NTLMv2 response only. Refuse LM & NTLM\" on servers and domain controllers. For events 4024 and 4025, move the network profile from MS-CHAPv2 to certificates (EAP-TLS) or turn on Credential Guard. Microsoft switches BlockNtlmv1SSO from audit to enforce, and then single sign-on with NTLMv1-derived credentials stops working.",
             [
+                new("Microsoft: Upcoming changes to NTLMv1 (BlockNtlmv1SSO)", "https://support.microsoft.com/help/5066470"),
                 new("Microsoft: LAN Manager authentication level", "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-security-lan-manager-authentication-level"),
                 new("Microsoft: Event 4624", "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4624"),
             ]),
@@ -82,6 +86,25 @@ public static class Guidance
             [
                 new("Microsoft: KDC event 16 or 27", "https://learn.microsoft.com/en-us/troubleshoot/windows-server/windows-security/kdc-event-16-27-des-encryption-disabled"),
                 new("Microsoft: Event 4771", "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4771"),
+            ]),
+        [LegacyKind.Smb1] = new(
+            "SMBv1",
+            "A client connected to this server with SMB version 1 (SMBServer Audit event 3000). The event is logged only after Set-SmbServerConfiguration -AuditSmb1Access $true.",
+            "SMBv1 has no protection against tampering and downgrade and was how WannaCry and NotPetya spread. Windows has shipped without it since Windows 10 1709 and Windows Server 2019, so the clients that still need it are usually old copiers, scanners, NAS boxes and embedded systems.",
+            "Update or reconfigure each client to SMB 2 or 3, or replace it. When the audit has stayed empty for a few weeks, remove SMB1 from the server with Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol.",
+            [
+                new("Microsoft: Detect, enable and disable SMBv1", "https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3"),
+                new("Microsoft: Stop using SMB1", "https://techcommunity.microsoft.com/blog/filecab/stop-using-smb1/425858"),
+            ]),
+        [LegacyKind.Ntlm] = new(
+            "NTLM",
+            "Something authenticated with NTLM, logged in the NTLM Operational log. Windows 11 24H2 and Windows Server 2025 write events 4020 to 4023 on clients and servers and 4030 to 4033 on domain controllers, Server 2019 and 2022 since the October 2026 updates. They name the reason NTLM was used. The older audit events 8001 to 8004 appear when a \"Restrict NTLM\" policy is set to audit.",
+            "NTLM can be relayed and its hashes cracked much more easily than Kerberos tickets. Microsoft is phasing NTLM out of Windows, so everything that still uses it needs a fix or an exception before it is turned off.",
+            "Read the reason in the details. A target given as an IP address, a missing or duplicate service principal name and local accounts are the usual causes. Connect by host name, register the missing SPN with setspn -S, list duplicates with setspn -X, and change applications that ask for NTLM directly to use Negotiate. The reason is logged only with \"NTLM Enhanced Logging\" (clients and servers) and \"Log Enhanced Domain-wide NTLM Logs\" (domain controllers), which are on by default.",
+            [
+                new("Microsoft: NTLM auditing enhancements", "https://support.microsoft.com/en-us/topic/overview-of-ntlm-auditing-enhancements-in-windows-11-version-24h2-and-windows-server-2025-b7ead732-6fc5-46a3-a943-27a4571d9e7b"),
+                new("Microsoft: Active Directory hardening, disabling NTLM", "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/active-directory-hardening-series---part-8-%E2%80%93-disabling-ntlm/4485782"),
+                new("MITRE ATT&CK T1557.001: LLMNR/NBT-NS poisoning and SMB relay", "https://attack.mitre.org/techniques/T1557/001/"),
             ]),
     };
 

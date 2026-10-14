@@ -52,7 +52,7 @@
         <ScrollViewer Grid.Column="0" Margin="0,0,16,0" VerticalScrollBarVisibility="Auto">
             <StackPanel>
                 <TextBlock Text="Legacy Auth Finder" FontSize="22" FontWeight="SemiBold" />
-                <TextBlock Text="NTLMv1, RC4, DES and unsigned LDAP in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,14" />
+                <TextBlock Text="NTLM, NTLMv1, RC4, DES, SMBv1 and unsigned LDAP in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,14" />
 
                 <Button Content="Open folder…" Click="OpenFolder_Click" IsEnabled="{Binding CanAct}"
                         HorizontalAlignment="Stretch" Padding="8,9" Margin="0,0,0,8" />
@@ -108,6 +108,7 @@
 
                 <StackPanel Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
                     <TextBlock Text="Export" FontWeight="SemiBold" Margin="0,0,0,6" />
+                    <Button Content="Fix list as CSV" Click="ExportFixes_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="Summary as CSV" Click="ExportSummary_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="All events as CSV" Click="ExportEvents_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="HTML report" Click="ExportHtml_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
@@ -116,8 +117,15 @@
 
                 <Button Content="Try the demo data" Click="Demo_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,12" />
 
-                <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12"
+                <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12" Margin="0,0,0,14"
                            Text="Read-only: the tool only reads the files. Tip: you can also drop a folder onto this window." />
+
+                <StackPanel Visibility="{Binding HasLog, Converter={StaticResource BoolToVis}}">
+                    <TextBlock Text="Diagnostic log" FontWeight="SemiBold" Margin="0,0,0,4" />
+                    <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12" Margin="0,0,0,6"
+                               Text="Timings, file sizes and the state of every running file, no account names or addresses. If a scan stops or crawls, send the newest file from this folder." />
+                    <Button Content="Open log folder" Click="OpenLogFolder_Click" HorizontalAlignment="Stretch" Padding="8,7" ToolTip="{Binding LogPath}" />
+                </StackPanel>
             </StackPanel>
         </ScrollViewer>
 
@@ -134,6 +142,32 @@
             </Grid>
 
             <TabControl SelectedIndex="{Binding SelectedTab}">
+                <TabItem Header="{Binding FixesHeader}">
+                    <DataGrid x:Name="FixGrid" Style="{StaticResource Grid}" ItemsSource="{Binding Fixes}" SelectionChanged="Grid_SelectionChanged"
+                              MouseDoubleClick="FixGrid_DoubleClick">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="#" Binding="{Binding Rank}" Width="42" />
+                            <DataGridTemplateColumn Header="Type" CellTemplate="{StaticResource KindCell}" Width="118" SortMemberPath="KindLabel" />
+                            <DataGridTextColumn Header="Fix on" Binding="{Binding TargetTypeText}" Width="115" />
+                            <DataGridTemplateColumn Header="Target" Width="1.4*" SortMemberPath="Target">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Target}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Target}" VerticalAlignment="Center" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTemplateColumn Header="Problem" Width="2.6*" SortMemberPath="Problem">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Problem}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Action}" VerticalAlignment="Center" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="Events" Binding="{Binding Events, StringFormat=N0}" Width="80" />
+                            <DataGridTextColumn Header="Last seen" Binding="{Binding LastSeen, StringFormat=yyyy-MM-dd}" Width="90" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </TabItem>
                 <TabItem Header="{Binding SummaryHeader}">
                     <DataGrid x:Name="SummaryGrid" Style="{StaticResource Grid}" ItemsSource="{Binding Summary}" SelectionChanged="Grid_SelectionChanged"
                               MouseDoubleClick="SummaryGrid_DoubleClick">
@@ -223,6 +257,11 @@
                         </ItemsControl>
                         <Button Content="Show these events" Click="ShowEvents_Click" HorizontalAlignment="Left" Padding="12,5" Margin="0,0,0,14"
                                 Visibility="{Binding CanShowEvents, Converter={StaticResource BoolToVis}}" />
+
+                        <StackPanel Visibility="{Binding HasFixAction, Converter={StaticResource BoolToVis}}">
+                            <TextBlock Text="Fix for this one" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding FixAction}" TextWrapping="Wrap" Margin="0,4,0,12" />
+                        </StackPanel>
 
                         <TextBlock Text="What it is" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding Guide.What}" TextWrapping="Wrap" Margin="0,4,0,12" />

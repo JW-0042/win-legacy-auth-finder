@@ -65,6 +65,14 @@ Three things fixed it:
 
 I also tried splitting a file into ranges of record IDs to get real progress. The API scans the whole file for every range, so 20 ranges were 16 times slower than one query. That idea went into the documentation as a dead end instead of into the code.
 
+## Version 0.3: when you cannot get the data
+
+The scan still stalled on a real archive of almost 90 GB, and 90 GB of security logs cannot be sent to anyone. So instead of guessing again, the tool got a diagnostic log the user can send. It records timings, file sizes and the state of every running file every 10 seconds, never the content of the events. A file whose read has not returned for 15 seconds is marked as stalled, together with how busy the Windows Event Log service is at that moment.
+
+Building it settled an old question. Measured on a test machine, the Event Log service read the files at 1.2 GB per second on 7 cores while the tool's own process read nothing. The service does all the file work for EvtQuery, so with many files at once that one service is the bottleneck. The log reads its counters from the system process list, which works without admin rights.
+
+The same release added the NTLM Operational log (with the reason Windows logs for every NTLM use), SMBv1 clients from the SMB audit log, and a ranked fix list that says what to change on which client, account or service account. The field names come from the provider manifests on Windows itself, not from blog posts.
+
 ## Quality gates
 
 - The build treats warnings as errors.

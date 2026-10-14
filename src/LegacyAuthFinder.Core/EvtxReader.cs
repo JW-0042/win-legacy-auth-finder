@@ -75,13 +75,41 @@ public static class Queries
         "*[System[(EventID=2887 or EventID=2889 or EventID=3039 or EventID=3074 or EventID=3075)]]",
         null, Positional: true);
 
-    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KerberosEtypeFailures, KdcWarnings, KdcEtypeErrors, Ldap];
+    // Field names taken from the provider manifests (Get-WinEvent -ListProvider). XPath compares names case-sensitively,
+    // so both spellings Microsoft uses (Username in 4020 to 4023, UserName in 4024, 4025 and 8001 to 8004) are listed.
+    public static readonly IReadOnlyList<string> NtlmOperationalFields =
+    [
+        "Username", "UserName", "DomainName", "Hostname", "ProcessName", "TargetMachine", "TargetDomain", "TargetService",
+        "TargetIP", "NtlmUsageId", "NtlmUsageReason", "NtlmVersion", "RemoteClientMachine", "ClientIP", "ClientNetworkName",
+        "Status", "StatusMsg", "TargetName", "ClientUserName", "ClientDomainName", "Workstation", "WorkstationName",
+        "LogonType", "SChannelName", "SChannelType", "AccountName", "AccountDomain", "AccountMachine", "ServerName",
+        "ServerDomain", "ServerIP", "ForwarderName", "ForwarderIP", "ChannelBindingStatus", "Mic Status", "DCName",
+    ];
+
+    // Enhanced NTLM auditing (Windows 11 24H2, Windows Server 2025, Server 2019 and 2022 from the October 2026 updates):
+    // 4020 to 4023 on clients and servers, 4030 to 4033 on domain controllers, 4024 and 4025 for NTLMv1-derived
+    // single sign-on. The older "Restrict NTLM" audit events 8001 to 8004 are read as well.
+    public static EvtxQuery NtlmOperational { get; } = new("NTLM use", Channels.NtlmOperational,
+        "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4020 and EventID<=4025) or (EventID>=4030 and EventID<=4033))]]",
+        NtlmOperationalFields);
+
+    // Logged only after Set-SmbServerConfiguration -AuditSmb1Access $true.
+    public static EvtxQuery Smb1 { get; } = new("SMBv1 access", Channels.SmbServerAudit,
+        "*[System[EventID=3000]]", ["ClientName"]);
+
+    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KerberosEtypeFailures, KdcWarnings, KdcEtypeErrors, Ldap, NtlmOperational, Smb1];
 
     public static IEnumerable<EvtxQuery> For(string channel) => All.Where(q => q.Channel == channel);
 }
 
 public sealed class WindowsEvtxReader : IEvtxReader
 {
+    /// <summary>Optional: called with the file path and "opening query", "reading" or "closing query". Used by the diagnostic log.</summary>
+    public Action<string, string>? OnPhase { get; set; }
+
+    /// <summary>Optional diagnostic log for the timings of <see cref="Inspect"/>.</summary>
+    public DiagLog? Log { get; set; }
+
     private static readonly HashSet<string> HexFields = new(StringComparer.Ordinal)
     {
         "TicketEncryptionType", "SessionKeyEncryptionType", "TicketOptions", "Status", "SubStatus", "FailureCode",
@@ -92,14 +120,19 @@ public sealed class WindowsEvtxReader : IEvtxReader
         var size = new FileInfo(path).Length;
         try
         {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             var info = EventLogSession.GlobalSession.GetLogInformation(path, PathType.FilePath);
+            var tInfo = clock.ElapsedMilliseconds;
             var (channel, computer, first, firstId) = Edge(path, reverse: false);
+            var tFirst = clock.ElapsedMilliseconds;
             var (_, _, last, lastId) = Edge(path, reverse: true);
+            Log?.Write("INSPECT", $"{Path.GetFileName(path)}: log information {tInfo} ms, first record {tFirst - tInfo} ms, last record {clock.ElapsedMilliseconds - tFirst} ms");
             return new LogFileInfo(path, size, channel ?? "(empty)", computer ?? "", info.RecordCount ?? 0, info.OldestRecordNumber ?? 0, first, last,
                 FirstRecordId: firstId, LastRecordId: lastId);
         }
         catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException)
         {
+            Log?.Error("INSPECT", Path.GetFileName(path), ex);
             return new LogFileInfo(path, size, "", "", 0, 0, null, null, $"Cannot read this file. It may be damaged or not an event log file. ({ex.Message.Trim()})");
         }
     }
@@ -126,7 +159,11 @@ public sealed class WindowsEvtxReader : IEvtxReader
 
     public IEnumerable<RawEvent> Read(string path, EvtxQuery query, CancellationToken cancellationToken, Action? alive = null)
     {
+        var phase = OnPhase;
+        phase?.Invoke(path, "opening query");
         using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, query.XPath));
+        using var closing = new PhaseOnDispose(phase, path, "closing query");
+        phase?.Invoke(path, "reading");
         using var selector = query.Fields is null
             ? null
             : new EventLogPropertySelector(query.Fields.Select(f => $"Event/EventData/Data[@Name='{f}']"));
@@ -163,6 +200,12 @@ public sealed class WindowsEvtxReader : IEvtxReader
             yield return new RawEvent(record.Id, record.ProviderName ?? "", record.TimeCreated ?? DateTime.MinValue,
                 record.MachineName ?? "", record.RecordId ?? 0, data, values);
         }
+    }
+
+    /// <summary>Reports the closing phase before the reader is disposed (disposal runs in reverse order).</summary>
+    private sealed class PhaseOnDispose(Action<string, string>? phase, string path, string name) : IDisposable
+    {
+        public void Dispose() => phase?.Invoke(path, name);
     }
 
     private static Dictionary<string, string> Named(IReadOnlyList<string> names, IList<object?> values)

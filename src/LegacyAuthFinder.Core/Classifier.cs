@@ -22,6 +22,8 @@ public static class Classifier
         "AccountSupportedEncryptionTypes", "AccountAvailableKeys",
         "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
         "DCSupportedEncryptionTypes", "DCAvailableKeys",
+        "TargetMachine", "TargetIP", "TargetName", "ClientNetworkName", "SChannelName",
+        "ChannelBindingStatus", "Mic Status", "StatusMsg",
     ];
 
     public static AuthEvent? Classify(RawEvent e, string file, StringPool pool) => e.EventId switch
@@ -32,8 +34,100 @@ public static class Classifier
         >= 201 and <= 209 when Providers.IsKdc(e.Provider) => KdcWarning(e, file, pool),
         14 or 16 or 26 or 27 when Providers.IsKdc(e.Provider) => KdcEtypeError(e, file, pool),
         2887 or 2889 or 3039 or 3074 or 3075 when e.Provider is "" || Providers.IsDirectoryService(e.Provider) => Ldap(e, file, pool),
+        (>= 8001 and <= 8004) or (>= 4020 and <= 4025) or (>= 4030 and <= 4033) when e.Provider is "" || Providers.IsNtlm(e.Provider) => NtlmUse(e, file, pool),
+        3000 when e.Provider is "" || e.Provider.Equals(Providers.SmbServer, StringComparison.OrdinalIgnoreCase) => Smb1(e, file, pool),
         _ => null,
     };
+
+    /// <summary>Reason IDs of the enhanced NTLM events, from Microsoft's NTLM auditing overview.</summary>
+    public static string NtlmReason(string id) => id.Trim() switch
+    {
+        "0" => "unknown reason",
+        "1" => "called directly by the application",
+        "2" => "local account",
+        "4" => "cloud account",
+        "5" => "target name missing or empty",
+        "6" => "target name not resolved by Kerberos",
+        "7" => "target name is an IP address",
+        "8" => "target name duplicated in Active Directory",
+        "9" => "no line of sight to a domain controller",
+        "10" => "loopback",
+        "11" => "null session",
+        _ => "",
+    };
+
+    /// <summary>"NTLMv1", "1", "NTLM V1" and "v1" become "NTLMv1", the same for v2. LM stays LM, unknown text is kept.</summary>
+    public static string NtlmVersion(string value)
+    {
+        value = Clean(value);
+        if (value.Length == 0) return "";
+        if (value.Equals("LM", StringComparison.OrdinalIgnoreCase)) return "LM";
+        var digits = value.Where(char.IsDigit).ToArray();
+        return digits.Length == 0 ? value : digits[^1] switch
+        {
+            '1' => "NTLMv1",
+            '2' => "NTLMv2",
+            _ => value,
+        };
+    }
+
+    /// <summary>
+    /// NTLM Operational log. Field names from the provider manifests:
+    /// 4020/4021 (outgoing, on the client): Username, DomainName, Hostname, TargetMachine, TargetService, TargetIP, NtlmUsageId, NtlmUsageReason, NtlmVersion.
+    /// 4022/4023 (incoming, on the server): Username, DomainName, RemoteClientMachine, ClientIP, ClientNetworkName, NtlmVersion.
+    /// 4030 to 4033 (domain controller): AccountName, AccountDomain, AccountMachine, ServerName, NtlmVersion.
+    /// 4024/4025 (NTLMv1-derived single sign-on) and 8001: TargetName, UserName, DomainName, ProcessName.
+    /// 8002: ClientUserName, ClientDomainName. 8003: UserName, DomainName, Workstation. 8004: SChannelName, UserName, DomainName, WorkstationName.
+    /// The odd numbers 4021, 4023, 4031 and 4033 are warnings, logged for a security downgrade such as NTLMv1.
+    /// </summary>
+    private static AuthEvent NtlmUse(RawEvent e, string file, StringPool pool)
+    {
+        var version = NtlmVersion(e["NtlmVersion"]);
+        // The ID maps to fixed wording that the fix list understands. The logged text is the fallback for new IDs.
+        var reason = NtlmReason(e["NtlmUsageId"]);
+        if (reason.Length == 0) reason = First(e, "NtlmUsageReason");
+        var weak = version is "NTLMv1" or "LM";
+        var downgrade = e.EventId is 4021 or 4023 or 4031 or 4033;
+        string Ver(string fallback) => version.Length > 0 ? version : fallback;
+        string With(string text) => reason.Length > 0 ? $"{text}, {reason}" : text;
+
+        var (account, domain, client, service, variant) = e.EventId switch
+        {
+            4020 or 4021 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), First(e, "Hostname").Length > 0 ? First(e, "Hostname") : ShortHost(e.Computer),
+                First(e, "TargetService", "TargetMachine", "TargetIP"), With($"Outgoing {Ver("NTLM")}")),
+            4022 or 4023 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), CleanIp(First(e, "ClientIP", "RemoteClientMachine", "ClientNetworkName")),
+                "", $"Incoming {Ver("NTLM")}"),
+            >= 4030 and <= 4033 => (Clean(e["AccountName"]), Clean(e["AccountDomain"]), Clean(e["AccountMachine"]), Clean(e["ServerName"]),
+                $"Checked by the domain controller, {Ver("NTLM")}"),
+            4024 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
+                "NTLMv1-derived single sign-on credentials (audit)"),
+            4025 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
+                "NTLMv1-derived single sign-on credentials blocked"),
+            8001 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
+                "Outgoing NTLM (audit 8001)"),
+            8002 => (Clean(e["ClientUserName"]), Clean(e["ClientDomainName"]), "", "", "Incoming NTLM (audit 8002)"),
+            8003 => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["Workstation"]), "", "Incoming NTLM with a domain account (audit 8003)"),
+            _ => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["WorkstationName"]), Clean(e["SChannelName"]), "NTLM checked by the domain controller (audit 8004)"),
+        };
+        if (downgrade && !weak) variant += ", security downgrade";
+        var kind = weak || e.EventId is 4024 or 4025 ? LegacyKind.Ntlmv1 : LegacyKind.Ntlm;
+        return Build(e, file, pool, kind, variant, account, domain, client, service, "", "",
+            extra: [("Reason", reason), ("NTLM version", version)]);
+    }
+
+    /// <summary>SMBServer Audit 3000: "SMB1 access, Client Address: %1". The field is called ClientName.</summary>
+    private static AuthEvent Smb1(RawEvent e, string file, StringPool pool)
+    {
+        var client = CleanIp(Clean(e["ClientName"]).TrimStart('\\'));
+        return Build(e, file, pool, LegacyKind.Smb1, "SMBv1 connection", "", "", client, "SMB", "", "",
+            extra: [("Client address", Clean(e["ClientName"]))]);
+    }
+
+    private static string ShortHost(string computer)
+    {
+        var dot = computer.IndexOf('.');
+        return dot > 0 ? computer[..dot] : computer;
+    }
 
     private static bool IsEtypeFailure(RawEvent e) =>
         ParseEtype(e["Status"]) == EtypeNotSupported || ParseEtype(e["FailureCode"]) == EtypeNotSupported;
@@ -293,6 +387,12 @@ public static class Providers
     public const string SecurityAuditing = "Microsoft-Windows-Security-Auditing";
     public const string Kdc = "Microsoft-Windows-Kerberos-Key-Distribution-Center";
     public const string KdcSvc = "KDCSVC";
+    public const string Ntlm = "Microsoft-Windows-NTLM";
+    public const string Netlogon = "Microsoft-Windows-Security-Netlogon";
+    public const string SmbServer = "Microsoft-Windows-SMBServer";
+
+    public static bool IsNtlm(string provider) =>
+        provider.Equals(Ntlm, StringComparison.OrdinalIgnoreCase) || provider.Equals(Netlogon, StringComparison.OrdinalIgnoreCase);
 
     public const string DirectoryService = "Microsoft-Windows-ActiveDirectory_DomainService";
 

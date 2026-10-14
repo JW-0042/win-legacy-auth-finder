@@ -39,6 +39,25 @@ public static class Storage
         }
     }
 
+    /// <summary>Details for the diagnostic log: drive type, file system, free space and the seek penalty answer.</summary>
+    public static string Explain(string folder)
+    {
+        try
+        {
+            var full = Path.GetFullPath(folder);
+            var root = Path.GetPathRoot(full) ?? "";
+            if (full.StartsWith(@"\\", StringComparison.Ordinal)) return $"network path, root {root}";
+            var drive = new DriveInfo(root);
+            var penalty = root.Length >= 2 ? SeekPenalty(root[..2]) : null;
+            return $"drive {root} type {drive.DriveType}, {(drive.IsReady ? $"{drive.DriveFormat}, {drive.AvailableFreeSpace / 1073741824} of {drive.TotalSize / 1073741824} GB free" : "not ready")}, "
+                + $"seek penalty {(penalty is null ? "unknown (query failed)" : penalty.Value ? "yes (hard disk)" : "no (SSD)")}";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return $"could not inspect the drive: {ex.Message}";
+        }
+    }
+
     public static int RecommendedThreads(StorageKind kind) => kind switch
     {
         StorageKind.Ssd => Math.Clamp(Environment.ProcessorCount, 2, 8),

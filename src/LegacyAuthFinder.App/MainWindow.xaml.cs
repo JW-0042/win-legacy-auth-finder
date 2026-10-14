@@ -60,9 +60,29 @@ public partial class MainWindow : Window
         if (SummaryGrid.SelectedItem is SummaryRow row) Vm.ShowEventsFor(row);
     }
 
+    private void FixGrid_DoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (FixGrid.SelectedItem is FixItem item) Vm.ShowEventsFor(item);
+    }
+
     private void ShowEvents_Click(object sender, RoutedEventArgs e)
     {
         if (Vm.Selection is SummaryRow row) Vm.ShowEventsFor(row);
+        else if (Vm.Selection is FixItem item) Vm.ShowEventsFor(item);
+    }
+
+    private void ExportFixes_Click(object sender, RoutedEventArgs e) =>
+        Save("CSV file|*.csv", "legacy-auth-fix-list.csv", path =>
+        {
+            using var w = new StreamWriter(path, false, Reports.CsvEncoding);
+            Reports.WriteFixesCsv(w, Vm.Fixes);
+        });
+
+    private void OpenLogFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (Vm.LogPath.Length == 0) return;
+        // Selects the current log file in Explorer, so it is easy to attach.
+        Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{Vm.LogPath}\"") { UseShellExecute = true });
     }
 
     private void ExportSummary_Click(object sender, RoutedEventArgs e) =>

@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows.Threading;
@@ -13,7 +14,7 @@ public sealed record DetailRow(string Label, string Value);
 public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChanged
 {
     private FileState _state = info.IsRelevant ? FileState.Queued : info.Error is null ? FileState.Skipped : FileState.Error;
-    private string _status = info.Error ?? (info.IsRelevant ? "Ready to scan" : "Skipped: not a Security, System or Directory Service log");
+    private string _status = info.Error ?? (info.IsRelevant ? "Ready to scan" : "Skipped: this log cannot contain the events the tool looks for");
     private long _hits;
     private double _percent;
     private DateTime? _startedAt;
@@ -22,7 +23,7 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
 
     public LogFileInfo Info { get; } = info;
     public string Name => Path.GetRelativePath(root, Info.Path);
-    public string Log => Info.Error is null ? Info.Channel : "unreadable";
+    public string Log => Info.Error is null ? Channels.Short(Info.Channel) : "unreadable";
     public string Computer => Info.Computer;
     public string SizeText => Reports.SizeText(Info.Size);
     public long Size => Info.Size;
@@ -68,7 +69,10 @@ public sealed record KindTile(LegacyKind Kind, string Label, string Count);
 
 public sealed class MainViewModel : INotifyPropertyChanged
 {
-    private readonly IEvtxReader _reader = new WindowsEvtxReader();
+    private readonly WindowsEvtxReader _reader = new();
+    private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
+    private DiagLog? _log;
+    private long _uiUpdates;
     private readonly DispatcherTimer _searchTimer;
     private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
     private Action? _onTick;
@@ -85,6 +89,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _search = "";
     private IReadOnlyList<AuthEvent> _events = [];
     private IReadOnlyList<SummaryRow> _summary = [];
+    private IReadOnlyList<FixItem> _fixes = [];
     private int _tab;
     private object? _selection;
     private IReadOnlyList<LogFileInfo> _inventory = [];
@@ -104,6 +109,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+
+    /// <summary>Diagnostic log of this session. Set by the app at start, null in screenshot mode.</summary>
+    public void AttachLog(DiagLog log)
+    {
+        _log = log;
+        _reader.Log = log;
+        OnChanged(nameof(LogPath));
+        OnChanged(nameof(HasLog));
+    }
+
+    public string LogPath => _log?.Path ?? "";
+    public bool HasLog => _log?.IsEnabled == true;
 
     public ObservableCollection<FileRow> Files { get; } = [];
     public IReadOnlyList<string> KindFilters { get; } = ["All", .. Guidance.Order.Select(Guidance.Label)];
@@ -126,7 +143,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    public int Threads { get => _threads; set { _threads = value; OnChanged(); OnChanged(nameof(StorageText)); } }
+    public int Threads
+    {
+        get => _threads;
+        set
+        {
+            if (_threads != value) _log?.Write("UI", $"Files at once set to {value} (recommended {_recommended})");
+            _threads = value;
+            OnChanged();
+            OnChanged(nameof(StorageText));
+        }
+    }
 
     /// <summary>What kind of disk the folder is on and whether the chosen number of files fits it.</summary>
     public string StorageText => !HasFolder || _isDemo
@@ -149,7 +176,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         private set
         {
             _result = value;
-            foreach (var n in new[] { nameof(Result), nameof(HasResult), nameof(Tiles), nameof(HeadlineText), nameof(TruncatedText), nameof(IsTruncated), nameof(ScopeText), nameof(ScanButtonText) })
+            foreach (var n in new[] { nameof(Result), nameof(HasResult), nameof(Tiles), nameof(HeadlineText), nameof(TruncatedText), nameof(IsTruncated), nameof(ScopeText), nameof(ScanButtonText), nameof(FixesHeader) })
             {
                 OnChanged(n);
             }
@@ -172,7 +199,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string HeadlineText => _result switch
     {
         null when RelevantCount > 0 => $"{RelevantCount} {(RelevantCount == 1 ? "log is" : "logs are")} ready. Press Start scan when you are ready.",
-        null when HasFolder => "No Security, System or Directory Service logs in this folder.",
+        null when HasFolder => "No Security, System, Directory Service, NTLM or SMB audit logs in this folder.",
         null => "Open a folder with archived .evtx files from your servers. The tool works out which log each file is, then you start the scan.",
         { Cancelled: true } => $"Scan cancelled. {_result.TotalHits:N0} events found so far.",
         { TotalHits: 0 } => _result.Files.Count(f => f.IsRelevant) is var n && n == 1
@@ -190,6 +217,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public IReadOnlyList<AuthEvent> Events { get => _events; private set { _events = value; OnChanged(); OnChanged(nameof(EventsHeader)); } }
     public IReadOnlyList<SummaryRow> Summary { get => _summary; private set { _summary = value; OnChanged(); OnChanged(nameof(SummaryHeader)); } }
+    public IReadOnlyList<FixItem> Fixes { get => _fixes; private set { _fixes = value; OnChanged(); OnChanged(nameof(FixesHeader)); } }
+    public string FixesHeader => _result is null ? "What to fix" : $"What to fix ({_fixes.Count:N0})";
     public string EventsHeader => _result is null ? "Events" : $"Events ({_events.Count:N0})";
     public string SummaryHeader => _result is null ? "Who uses it" : $"Who uses it ({_summary.Count:N0})";
     public string FilesHeader => $"Files ({Files.Count})";
@@ -202,22 +231,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set
         {
             _selection = value;
-            foreach (var n in new[] { nameof(Selection), nameof(HasSelection), nameof(DetailTitle), nameof(DetailRows), nameof(Guide), nameof(DetailKind), nameof(CanShowEvents) })
+            foreach (var n in new[] { nameof(Selection), nameof(HasSelection), nameof(DetailTitle), nameof(DetailRows), nameof(Guide), nameof(DetailKind), nameof(CanShowEvents), nameof(FixAction), nameof(HasFixAction) })
             {
                 OnChanged(n);
             }
         }
     }
 
-    public bool HasSelection => _selection is AuthEvent or SummaryRow;
-    public bool CanShowEvents => _selection is SummaryRow;
-    public LegacyKind? DetailKind => _selection switch { AuthEvent e => e.Kind, SummaryRow s => s.Kind, _ => null };
+    public bool HasSelection => _selection is AuthEvent or SummaryRow or FixItem;
+    public bool CanShowEvents => _selection is SummaryRow or FixItem;
+    public LegacyKind? DetailKind => _selection switch { AuthEvent e => e.Kind, SummaryRow s => s.Kind, FixItem f => f.Kind, _ => null };
+    public string FixAction => _selection is FixItem f ? f.Action : "";
+    public bool HasFixAction => _selection is FixItem;
     public KindGuidance? Guide => DetailKind is { } k ? Guidance.For(k) : null;
 
     public string DetailTitle => _selection switch
     {
         AuthEvent e => $"{e.KindLabel} · {e.What}",
         SummaryRow s => $"{s.KindLabel} · {s.Count:N0} events",
+        FixItem f => $"{f.Rank}. {f.Problem}",
         _ => "",
     };
 
@@ -234,6 +266,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
             ("Account", s.Account), ("Client", s.Client), ("Service", s.Service), ("Events", s.Count.ToString("N0")),
             ("First seen", s.FirstSeen.ToString("yyyy-MM-dd HH:mm")), ("Last seen", s.LastSeen.ToString("yyyy-MM-dd HH:mm")),
             ("Logged on", s.ComputersText), ("Details", s.VariantsText)).ToList(),
+        FixItem f => Rows(
+            ("Fix on", f.TargetTypeText), ("Target", f.Target), ("Events", f.Events.ToString("N0")),
+            ("First seen", f.FirstSeen.ToString("yyyy-MM-dd HH:mm")), ("Last seen", f.LastSeen.ToString("yyyy-MM-dd HH:mm")),
+            ("Accounts", f.AccountsText), ("Clients", f.ClientsText), ("Services", f.ServicesText), ("Logged on", f.ComputersText)).ToList(),
         _ => [],
     };
 
@@ -252,25 +288,38 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Selection = null;
         Events = [];
         Summary = [];
+        Fixes = [];
         _inventory = [];
         Files.Clear();
         OnChanged(nameof(FilesHeader));
-        SelectedTab = 2;
+        SelectedTab = 3;
+        _log?.Write("UI", $"Open folder {folder} (subfolders {Recurse})");
         try
         {
             StatusText = "Finding .evtx files and checking which log each one is…";
             OverallProgress = 0;
             _storage = await Task.Run(() => Storage.Detect(folder), token);
             _recommended = Storage.RecommendedThreads(_storage);
+            if (_log is not null)
+            {
+                var explain = await Task.Run(() => Storage.Explain(folder), token);
+                _log.Write("FOLDER", $"Storage {_storage}: {explain}. Recommended {_recommended} files at once.");
+            }
             Threads = ThreadChoices.Contains(_recommended) ? _recommended : 4;
             var recurse = Recurse;
             var parallel = Math.Max(4, Threads);
-            _inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, maxParallel: parallel, cancellationToken: token), token);
+            var log = _log;
+            _inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, maxParallel: parallel, cancellationToken: token, log: log), token);
             foreach (var f in _inventory) Files.Add(new FileRow(f, folder));
         }
         catch (OperationCanceledException)
         {
-            // The user cancelled the folder read.
+            _log?.Write("UI", "Folder read cancelled");
+        }
+        catch (Exception ex)
+        {
+            _log?.Error("UI", "Open folder failed", ex);
+            throw;
         }
         finally
         {
@@ -295,7 +344,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Selection = null;
         Events = [];
         Summary = [];
-        SelectedTab = 2;
+        Fixes = [];
+        SelectedTab = 3;
 
         // Fresh rows, so a second scan starts from a clean state.
         Files.Clear();
@@ -332,6 +382,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             StatusText = $"Starting {relevant.Count} logs…";
             var progress = new Progress<FileProgress>(p =>
             {
+                Interlocked.Increment(ref _uiUpdates);
                 if (rows.TryGetValue(p.Path, out var row)) row.Update(p);
                 Refresh();
             });
@@ -341,10 +392,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 Refresh();
             };
             _clock.Start();
-            var options = new ScanOptions(Threads);
+            var options = new ScanOptions(Threads, Log: _log);
+            _log?.Write("UI", $"Start scan: {relevant.Count} files, {Threads} at once (recommended {_recommended} for {_storage})");
+            var probe = _log is null ? null : StartUiProbe(_log, token);
             var inventory = _inventory;
-            var result = await Task.Run(() => Scanner.Scan(_reader, inventory, folder, options, progress, token));
-            Show(result);
+            try
+            {
+                var result = await Task.Run(() => Scanner.Scan(_reader, inventory, folder, options, progress, token));
+                _log?.Write("UI", $"Scan returned: {result.TotalHits:N0} events, {result.Fixes.Count:N0} things to fix, cancelled {result.Cancelled}");
+                Show(result);
+            }
+            catch (Exception ex)
+            {
+                _log?.Error("UI", "Scan failed", ex);
+                throw;
+            }
+            finally
+            {
+                probe?.Cancel();
+            }
         }
         finally
         {
@@ -355,7 +421,42 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    public void Cancel() => _scanCts?.Cancel();
+    public void Cancel()
+    {
+        _log?.Write("UI", "Cancel clicked");
+        _scanCts?.Cancel();
+    }
+
+    /// <summary>
+    /// Measures how fast the window answers while a scan runs. A busy UI thread would look like a stuck scan,
+    /// so slow answers and the number of progress updates go to the diagnostic log.
+    /// </summary>
+    private CancellationTokenSource StartUiProbe(DiagLog log, CancellationToken scan)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(scan);
+        var token = cts.Token;
+        _ = Task.Run(async () =>
+        {
+            var round = 0;
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), token);
+                    var clock = Stopwatch.StartNew();
+                    await _dispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+                    var ms = clock.ElapsedMilliseconds;
+                    if (ms > 500) log.Write("UI", $"Window answered after {ms} ms");
+                    if (++round % 6 == 0) log.Write("UI", $"Window answers in {ms} ms, {Interlocked.Exchange(ref _uiUpdates, 0):N0} progress updates in the last 30 s");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Scan finished.
+            }
+        }, CancellationToken.None);
+        return cts;
+    }
 
     public async Task LoadDemoAsync()
     {
@@ -387,8 +488,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Result = result;
         Events = result.Events;
         Summary = result.Summary;
+        Fixes = result.Fixes;
         SelectedTab = 0;
-        Selection = result.Summary.FirstOrDefault();
+        Selection = result.Fixes.FirstOrDefault();
         if (_search.Length > 0 || _kindFilter != "All") _ = ApplyFilterAsync();
     }
 
@@ -399,7 +501,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OnChanged(nameof(KindFilter));
         _search = string.Join(' ', new[] { row.Account, row.Client, row.Service }.Where(x => x.Length > 0 && !x.Contains(' ')));
         OnChanged(nameof(Search));
-        SelectedTab = 1;
+        SelectedTab = 2;
+        _ = ApplyFilterAsync();
+    }
+
+    /// <summary>Shows the events behind a fix item by searching for its target.</summary>
+    public void ShowEventsFor(FixItem item)
+    {
+        _kindFilter = item.KindLabel;
+        OnChanged(nameof(KindFilter));
+        _search = item.Target.Contains(' ') || item.Target.StartsWith('(') ? "" : item.Target;
+        OnChanged(nameof(Search));
+        SelectedTab = 2;
         _ = ApplyFilterAsync();
     }
 
@@ -413,16 +526,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var source = _result;
         try
         {
-            var (events, summary) = await Task.Run(() =>
+            var (events, summary, fixes) = await Task.Run(() =>
             {
                 var ev = source.Events.AsParallel().AsOrdered().WithCancellation(cts.Token)
                     .Where(e => (kind is null || e.Kind == kind) && (terms.Length == 0 || e.Matches(terms))).ToList();
                 var sm = source.Summary.Where(s => (kind is null || s.Kind == kind) && (terms.Length == 0 || s.Matches(terms))).ToList();
-                return (ev, sm);
+                var fx = source.Fixes.Where(f => (kind is null || f.Kind == kind) && (terms.Length == 0 || f.Matches(terms))).ToList();
+                return (ev, sm, fx);
             }, cts.Token);
             if (cts.IsCancellationRequested) return;
             Events = events;
             Summary = summary;
+            Fixes = fixes;
         }
         catch (OperationCanceledException)
         {

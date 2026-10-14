@@ -4,7 +4,8 @@ namespace LegacyAuthFinder.Core;
 /// A made-up CONTOSO domain with two domain controllers and a file server. Old copiers and a legacy XP box use
 /// NTLMv1, service accounts with old passwords get RC4 tickets and one Unix service still asks for DES.
 /// The copier also reads the directory over plain LDAP with a cleartext password, and the Unix box fails Kerberos
-/// whenever it asks for AES.
+/// whenever it asks for AES. The NTLM Operational logs show who still uses NTLM at all and why, and the SMB audit
+/// log shows the copier and the NAS connecting with SMBv1.
 /// The events go through the real scanner, classifier and summary, only the file reading is simulated.
 /// Addresses are private ranges, names are fictional.
 /// </summary>
@@ -36,6 +37,10 @@ public static class DemoData
                 File(@"DC02\Archive-Security-2026-09-21-02-12-47-118.evtx", Channels.Security, "DC02.contoso.local", 3_872_391_168, 0, 14),
                 File(@"FS01\Archive-Security-2026-09-20-17-03-12-555.evtx", Channels.Security, "FS01.contoso.local", 1_073_676_288, 0, 14),
                 File(@"FS01\Archive-Application-2026-09-20-17-03-12-555.evtx", "Application", "FS01.contoso.local", 20_975_616, 0, 14),
+                File(@"DC01\Archive-Microsoft-Windows-NTLM%4Operational-2026-09-20.evtx", Channels.NtlmOperational, "DC01.contoso.local", 104_857_600, 0, 14),
+                File(@"FS01\Archive-Microsoft-Windows-NTLM%4Operational-2026-09-20.evtx", Channels.NtlmOperational, "FS01.contoso.local", 52_428_800, 0, 14),
+                File(@"APP02\Archive-Microsoft-Windows-NTLM%4Operational-2026-09-20.evtx", Channels.NtlmOperational, "APP02.contoso.local", 20_971_520, 0, 14),
+                File(@"FS01\Archive-Microsoft-Windows-SMBServer%4Audit-2026-09-20.evtx", Channels.SmbServerAudit, "FS01.contoso.local", 1_048_576, 0, 14),
                 new(@"D:\Logs\contoso-archive\FS01\Archive-Security-2026-08-30-copy-broken.evtx", 512_000, "", "", 0, 0, null, null,
                     "The event log file is corrupted."),
             ];
@@ -96,6 +101,36 @@ public static class DemoData
             }
             Kdc(random, "DC01", 202, "svc-erp", "HTTP/erp.contoso.local", 9);
             Kdc(random, "DC01", 207, "admin-old", "krbtgt", 4);
+
+            // NTLM Operational: the reasons NTLM is still used, and NTLMv1 seen by the enhanced events.
+            NtlmOp(random, "APP02", 4020, 380, new() { ["Username"] = "svc-report", ["DomainName"] = Domain, ["Hostname"] = "APP02", ["TargetMachine"] = "10.0.10.21",
+                ["TargetIP"] = "10.0.10.21", ["NtlmUsageId"] = "7", ["NtlmUsageReason"] = "Target name contains an IP address", ["NtlmVersion"] = "2", ["ProcessName"] = @"C:\Program Files\ReportServers.exe" });
+            NtlmOp(random, "APP02", 4020, 160, new() { ["Username"] = "svc-report", ["DomainName"] = Domain, ["Hostname"] = "APP02", ["TargetService"] = "HTTP/reports.contoso.local",
+                ["NtlmUsageId"] = "6", ["NtlmVersion"] = "2", ["ProcessName"] = @"C:\Program Files\ReportServers.exe" });
+            NtlmOp(random, "APP02", 4024, 8, new() { ["TargetName"] = "vpn01.contoso.local", ["UserName"] = "m.kovac", ["DomainName"] = Domain, ["ProcessName"] = @"C:\Windows\System32\svchost.exe" });
+            NtlmOp(random, "FS01", 4022, 300, new() { ["Username"] = "backup-svc", ["DomainName"] = Domain, ["RemoteClientMachine"] = "NAS01", ["ClientIP"] = "10.0.20.40", ["NtlmVersion"] = "2" });
+            NtlmOp(random, "FS01", 4023, 25, new() { ["Username"] = "j.novak", ["DomainName"] = Domain, ["RemoteClientMachine"] = "LEGACY-XP01", ["ClientIP"] = "10.0.30.7", ["NtlmVersion"] = "1" });
+            NtlmOp(random, "DC01", 4032, 540, new() { ["AccountName"] = "h.simon", ["AccountDomain"] = Domain, ["AccountMachine"] = "KIOSK-03", ["ServerName"] = "FS01", ["NtlmVersion"] = "2" });
+            NtlmOp(random, "DC01", 8004, 120, new() { ["SChannelName"] = "FS01", ["UserName"] = "scanner", ["DomainName"] = Domain, ["WorkstationName"] = "PRN-OLD-1F" });
+
+            // SMBv1 clients, logged after Set-SmbServerConfiguration -AuditSmb1Access $true.
+            foreach (var (ip, count) in new[] { ("10.0.20.15", 410), ("10.0.20.40", 95) })
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    Add(PathFor("FS01", Channels.SmbServerAudit), new RawEvent(3000, Providers.SmbServer, RandomTime(random), "FS01.contoso.local", 0,
+                        new Dictionary<string, string> { ["ClientName"] = ip }));
+                }
+            }
+        }
+
+        private void NtlmOp(Random r, string host, int id, int count, Dictionary<string, string> data)
+        {
+            var provider = id >= 4030 && id <= 4033 || id == 8004 ? Providers.Netlogon : Providers.Ntlm;
+            for (var i = 0; i < count; i++)
+            {
+                Add(PathFor(host, Channels.NtlmOperational), new RawEvent(id, provider, RandomTime(r), $"{host}.contoso.local", 0, data));
+            }
         }
 
         public IReadOnlyList<LogFileInfo> Files { get; }
@@ -213,6 +248,8 @@ public static class DemoData
         4768 or 4769 or 4770 => Queries.Kerberos,
         14 or 16 or 26 or 27 => Queries.KdcEtypeErrors,
         >= 201 and <= 209 => Queries.KdcWarnings,
+        3000 => Queries.Smb1,
+        (>= 8001 and <= 8004) or (>= 4020 and <= 4025) or (>= 4030 and <= 4033) => Queries.NtlmOperational,
         _ => Queries.Ldap,
     };
 }

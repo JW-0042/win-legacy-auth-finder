@@ -21,6 +21,8 @@ internal static class Palette
     public static readonly SolidColorBrush Ldap = Make(0x7C, 0x3A, 0xED);
     public static readonly SolidColorBrush Cbt = Make(0x0E, 0x74, 0x90);
     public static readonly SolidColorBrush Etype = Make(0x2F, 0x6F, 0xD6);
+    public static readonly SolidColorBrush Smb1 = Make(0x9A, 0x34, 0x12);
+    public static readonly SolidColorBrush NtlmAny = Make(0x4B, 0x5B, 0x6E);
     public static readonly SolidColorBrush Ok = Make(0x1F, 0x9D, 0x55);
     public static readonly SolidColorBrush Busy = Make(0x2F, 0x80, 0xED);
     public static readonly SolidColorBrush Gray = Make(0x8A, 0x93, 0x9E);
@@ -37,6 +39,8 @@ public sealed class KindBrushConverter : IValueConverter
         LegacyKind.LdapSigning => Palette.Ldap,
         LegacyKind.LdapChannelBinding => Palette.Cbt,
         LegacyKind.EtypeFailure => Palette.Etype,
+        LegacyKind.Smb1 => Palette.Smb1,
+        LegacyKind.Ntlm => Palette.NtlmAny,
         _ => Palette.Gray,
     };
 

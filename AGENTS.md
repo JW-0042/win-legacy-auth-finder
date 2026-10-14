@@ -12,8 +12,11 @@
 - **The tool is read-only.** Never write to the scanned files or folders.
 - **All file access goes through `IEvtxReader`.** The real reader is `WindowsEvtxReader`.
 - **Filter inside the event log API.** Queries are XPath strings in `Queries` (EvtxReader.cs), and fields are read by name with `EventLogPropertySelector`. Do not switch to reading every record or rendering XML for the big Security queries, because it makes 4 GB files slow.
-- **Classification lives in `Classifier`.** Every change needs tests in `ClassifierTests`, including cases that must be ignored.
-- **Event field names.** Check them against current Microsoft documentation. They change: 4768 and 4769 got new fields in 2025, and KDCSVC events 201 to 209 were added in 2026.
+- **Classification lives in `Classifier`.** Every change needs tests in `ClassifierTests` or `NtlmSmbTests`, including cases that must be ignored.
+- **The fix list lives in `Remediation`.** Every summary row becomes exactly one fix item, so the fix list always adds up to the total. Tests in `RemediationTests`.
+- **Diagnostic log.** `DiagLog` writes timings, file names and process counters, never event content (accounts, addresses, services). `ScanMonitor` writes the heartbeat and `STALL` lines. Keep it that way, users send these files for support.
+- **The Event Log service does the reading.** EvtQuery on a file runs in the Windows Event Log service (measured: the service reads the file, this process reads nothing). Its counters come from the system process list, which needs no admin rights.
+- **Event field names.** Check them against current Microsoft documentation. They change: 4768 and 4769 got new fields in 2025, and KDCSVC events 201 to 209 were added in 2026. The NTLM Operational and SMBServer Audit names come from the provider manifests (`(Get-WinEvent -ListProvider Microsoft-Windows-NTLM).Events`). XPath compares field names case-sensitively, and Microsoft uses both `Username` and `UserName`.
 - **The demo data must contain every type.** `Demo_covers_every_kind_and_file_state` enforces this.
 
 ## Text style
@@ -25,6 +28,7 @@ Plain English. No em dashes and no semicolons joining sentences.
 Screenshot mode always uses the demo data, so no real names end up in public images. Regenerate the screenshots with:
 
 ```
+LegacyAuthFinder.exe --screenshot docs/screenshot-fix-light.png --theme light --tab fix
 LegacyAuthFinder.exe --screenshot docs/screenshot-summary-light.png --theme light --tab summary
 LegacyAuthFinder.exe --screenshot docs/screenshot-summary-dark.png --theme dark --tab summary
 LegacyAuthFinder.exe --screenshot docs/screenshot-events-light.png --theme light --tab events
