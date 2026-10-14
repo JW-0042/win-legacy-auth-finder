@@ -25,6 +25,7 @@ internal sealed class FileWork(LogFileInfo file, int order)
     public long LongestGapTicks;
     public long LongGaps;
     public long LastRecordId;
+    public double Fraction = -1;
     public bool StallReported;
 
     public string Phase => Volatile.Read(ref _phase);
@@ -95,12 +96,12 @@ internal sealed class ScanMonitor : IDisposable
                 _log.Write("BEAT", $"  [{w.Order:00}] {w.File.Name} ({Reports.SizeText(w.File.Size)}) T{w.ThreadId} {w.Query} | {w.Phase} for {Seconds(w.InPhase)}"
                     + $" | last sign of life {Seconds(quiet)} ago | records {w.Records:N0}, found {w.Hits:N0}, empty slices {w.Slices:N0}"
                     + $" | longest gap {Seconds(Stopwatch.GetElapsedTime(0, w.LongestGapTicks))}, gaps over 2 s {w.LongGaps}"
-                    + $" | at record {w.LastRecordId} of {w.File.FirstRecordId}..{w.File.LastRecordId}");
+                    + (w.Fraction >= 0 ? $" | {w.Fraction:P1} of the file read" : $" | at record {w.LastRecordId} of {w.File.FirstRecordId}..{w.File.LastRecordId}"));
                 if (quiet >= _stallAfter && !w.StallReported && w.Phase != "merging")
                 {
                     w.StallReported = true;
                     Stalls++;
-                    _log.Write("STALL", $"[{w.Order:00}] {w.File.Name}: no return from the event log API for {Seconds(quiet)} while '{w.Phase}' ({w.Query}). "
+                    _log.Write("STALL", $"[{w.Order:00}] {w.File.Name}: no progress for {Seconds(quiet)} while '{w.Phase}' ({w.Query}). "
                         + $"Running files: {running.Count}. Event Log service: {SystemProbe.Delta(_service, service)}");
                 }
             }

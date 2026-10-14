@@ -100,14 +100,15 @@ public static class Scanner
         }
 
         var threads = Math.Max(1, options.Threads);
-        log?.Write("SCAN", $"Start: {relevant.Count} files, {Reports.SizeText(relevant.Sum(f => f.Size))}, {threads} at once, event list limit {options.MaxEvents:N0}");
+        var mode = reader is IMultiQueryReader ? "built-in .evtx reader, one pass per file" : "Windows event log API, one pass per query";
+        log?.Write("SCAN", $"Start: {relevant.Count} files, {Reports.SizeText(relevant.Sum(f => f.Size))}, {threads} at once, {mode}, event list limit {options.MaxEvents:N0}");
         foreach (var f in relevant)
         {
             log?.Write("SCAN", $"  [{work[f.Path].Order:00}] {f.Name} {Reports.SizeText(f.Size)} '{f.Channel}': {string.Join(", ", Queries.For(f.Channel).Select(q => q.Name))}");
         }
 
         // The Windows reader reports when it opens and closes a query, so the log shows where a file waits.
-        var windows = reader as WindowsEvtxReader;
+        var windows = reader as WindowsEvtxReader ?? (reader as EvtxFileReader)?.Fallback as WindowsEvtxReader;
         if (windows is not null && log is not null)
         {
             windows.OnPhase = (path, phase) =>
@@ -148,9 +149,60 @@ public static class Scanner
                 var localEvents = new List<AuthEvent>();
                 long hits = 0;
                 var lastReport = Stopwatch.StartNew();
+                var fileNote = "";
                 try
                 {
-                    foreach (var query in Queries.For(file.Channel))
+                    // Built-in parser: one pass over the file answers every query, progress comes from the bytes read.
+                    if (reader is IMultiQueryReader multi)
+                    {
+                        var queries = Queries.For(file.Channel).ToList();
+                        var stats = new ReadStats();
+                        var passClock = Stopwatch.StartNew();
+                        var fraction = 0.0;
+                        w.Query = "one pass";
+                        w.Enter("parsing");
+                        w.Life();
+
+                        void Step(double share)
+                        {
+                            if (share >= 0)
+                            {
+                                fraction = share;
+                                w.Fraction = share;
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref w.Slices);
+                            }
+                            w.Life();
+                            if (lastReport.Elapsed <= ProgressInterval) return;
+                            Report(new FileProgress(file.Path, FileState.Scanning, hits, share >= 0 ? fraction : null,
+                                hits == 0 ? $"Reading, nothing found yet ({fraction:P0})" : $"Reading, {hits:N0} found ({fraction:P0})"));
+                            lastReport.Restart();
+                        }
+
+                        foreach (var (_, raw) in multi.ReadAll(file.Path, queries, cancellationToken, Step, stats))
+                        {
+                            Interlocked.Increment(ref w.Records);
+                            w.LastRecordId = raw.RecordId;
+                            w.Life();
+                            var e = Classifier.Classify(raw, file.Name, pool);
+                            if (e is null) continue;
+                            hits++;
+                            w.Hits = hits;
+                            SummaryRow.Add(local, e);
+                            if (Interlocked.Increment(ref kept) <= options.MaxEvents) localEvents.Add(e);
+                            else Volatile.Write(ref truncated, 1);
+                        }
+                        var passSeconds = passClock.Elapsed.TotalSeconds;
+                        log?.Write("PARSE", $"[{w.Order:00}] {file.Name}: {passSeconds:0.0} s, "
+                            + $"{(stats.Fallback is null ? $"{stats.Bytes / 1048576.0 / Math.Max(0.001, passSeconds):0} MB/s, " : "")}{stats}");
+                        if (stats.BadChunks > 0 || stats.BadRecords > 0)
+                        {
+                            fileNote = $", skipped {stats.BadChunks:N0} damaged chunks and {stats.BadRecords:N0} unreadable records";
+                        }
+                    }
+                    else foreach (var query in Queries.For(file.Channel))
                     {
                         var currentQuery = query;
                         var queryClock = Stopwatch.StartNew();
@@ -212,7 +264,7 @@ public static class Scanner
                     w.Enter("done");
                     var took = Stopwatch.GetElapsedTime(w.StartedAt).TotalSeconds;
                     log?.Write("FILE", $"[{w.Order:00}] done {file.Name} in {took:0.0} s, {hits:N0} found, {Reports.SizeText((long)(file.Size / Math.Max(0.001, took)))}/s");
-                    Report(new FileProgress(file.Path, FileState.Done, hits, 1, hits == 0 ? "Nothing found" : $"{hits:N0} events found"));
+                    Report(new FileProgress(file.Path, FileState.Done, hits, 1, (hits == 0 ? "Nothing found" : $"{hits:N0} events found") + fileNote));
                 }
                 catch (OperationCanceledException)
                 {

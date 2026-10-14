@@ -70,7 +70,7 @@ public sealed class DiagLogTests(ITestOutputHelper output) : IDisposable
         output.WriteLine(text);
         Assert.Equal(FileState.Done, r.FileResults["big.evtx"].State);
         Assert.Contains("STALL", text);
-        Assert.Contains("no return from the event log API", text);
+        Assert.Contains("no progress for", text);
         Assert.Contains("BEAT", text);
         Assert.Contains("SLOW", text);
     }

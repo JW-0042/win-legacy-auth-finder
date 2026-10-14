@@ -61,7 +61,9 @@ Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAva
 ## How it works
 
 1. **Inventory.** When you open a folder, every `.evtx` file in it and its subfolders is opened and its first record tells which log it belongs to. File names like `Archive-Security-...` are not trusted. Unreadable or damaged files are listed with the reason. Nothing is scanned yet, so you can check the file list first.
-2. **Scan.** Press Start scan. The logs are scanned with XPath filters that run inside the Windows event log API. The Windows Event Log service opens and filters the files, the tool only receives the matching records, so a 4 GB file is never loaded into memory. Reads come back every half second even when nothing matches, so Cancel stops within a second and each file shows how long it has been read.
+2. **Scan.** Press Start scan. The tool reads the `.evtx` files itself with a built-in parser: it streams each file once, in 4 MB blocks, and answers all questions for that log in the same pass. A record is only decoded in full when its event ID is one the tool looks for, so a 4 GB file is never loaded into memory and the disk reads it from start to end. Damaged parts of a file are skipped and counted, the rest is still read. Files that are not `.evtx` files at all go to the Windows event log API instead.
+   - **Why not the Windows API?** With the Windows API, the Windows Event Log service opens and filters every file. It needs one pass per question and has to evaluate the filter for every record. On a domain controller archive of 99 GB it ran at about 12 MB per second per file for the RC4 question, so a scan took the better part of an hour. The built-in reader is limited by the disk instead. "Use the Windows API" in the app, or `--windows-api`, switches back for comparison.
+   - **Same results.** The tests compare the parser with the Windows API on real exported logs, record by record: event ID, provider, time, computer, channel and every value, formatted the same way. On the CI runner this includes the Security log.
 3. **Files at once.** When you open a folder, the tool checks what kind of disk it is on and picks the number of files to scan in parallel: up to 8 on an SSD, 2 on a hard disk or a network share. You can change it, but on one hard disk more files at once make the disk seek between them and the whole scan slower.
 4. **Results.**
    - **What to fix** turns the findings into a ranked list of things to change: the client, the account, the service account, the domain controllers or the domain policy, with the concrete step. RC4 service tickets point to the service account behind the SPN, RC4 TGTs to the account without AES keys, RC4 session keys to the client, NTLM to the reason Windows logged. The most urgent types come first.
@@ -69,7 +71,7 @@ Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAva
    - **Events** lists every single event and is searchable.
    - **Files** shows the detected log, the computer, the time range and the result of each file.
 
-Because the Event Log service does the reading, it is the bottleneck when many files are scanned at once. On an SSD the scan runs at roughly 100 MB per second per file, so a 4 GB archive takes well under a minute. A hard disk or a network share is slower and the number of files at once matters more than anything else. Very large results are handled too: the event list keeps the first 2 million events, and the summary and totals always count all of them.
+With the built-in reader the disk sets the pace. On an SSD several files at once keep it busy, on a hard disk or a network share 2 files at once is best because each file is read from start to end. Very large results are handled too: the event list keeps the first 2 million events, and the summary and totals always count all of them.
 
 ## Searching
 
@@ -77,7 +79,7 @@ Type one or more words into the search box. A row matches when every word appear
 
 ## Diagnostic log
 
-Every session writes a diagnostic log to `%LOCALAPPDATA%\LegacyAuthFinder\Logs` (the newest 20 are kept). "Open log folder" in the app selects the current file. It records the disk type, every file with its size and record range, how long each query took, and every 10 seconds the state of each running file: what it is doing, when the event log API last answered, and how busy this process and the Windows Event Log service are (CPU, disk reads, threads). A file whose read has not returned for 15 seconds is marked `STALL`. The log never contains account names, client addresses or other event content, only file names and timings. If a scan gets stuck or crawls, this file shows where.
+Every session writes a diagnostic log to `%LOCALAPPDATA%\LegacyAuthFinder\Logs` (the newest 20 are kept). "Open log folder" in the app selects the current file. It records the disk type, every file with its size and record range, how long each file took (speed, chunks, records, damaged parts), and every 10 seconds the state of each running file: what it is doing, how much of it is read, and how busy this process and the Windows Event Log service are (CPU, disk reads, threads). A file without progress for 15 seconds is marked `STALL`. The log never contains account names, client addresses or other event content, only file names and timings. If a scan gets stuck or crawls, this file shows where.
 
 ## Download
 
@@ -93,7 +95,7 @@ No admin rights are needed to read copied `.evtx` files. GitHub Actions builds e
 ## Command line
 
 ```
-legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--log <file> | --no-log] [--quiet]
+legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--log <file> | --no-log] [--windows-api] [--quiet]
 ```
 
 The command line writes the same diagnostic log as the app, to the default folder or to `--log <file>`.
@@ -124,13 +126,13 @@ dotnet run --project src/LegacyAuthFinder.App
 ## Project layout
 
 ```
-src/LegacyAuthFinder.Core     file inventory, XPath queries, classification, summary, fix list, diagnostic log, demo data, reports
+src/LegacyAuthFinder.Core     .evtx parser, file inventory, queries, classification, summary, fix list, diagnostic log, demo data, reports
 src/LegacyAuthFinder.App      WPF desktop app (MVVM, Fluent theme)
 src/LegacyAuthFinder.Cli      command line front end
 tests/LegacyAuthFinder.Tests  unit tests plus integration tests against real exported logs
 ```
 
-The tool reads files through one interface, `IEvtxReader`. The unit tests use a fake reader. The integration tests export the System log of the machine they run on, and on CI also the Security log, and read it through the real Windows API. The demo data runs through the real scanner and summary, only the file reading is simulated.
+The tool reads files through one interface, `IEvtxReader`, with two implementations: the built-in parser (`EvtxFileReader`) and the Windows event log API (`WindowsEvtxReader`). The unit tests use a fake reader. The integration tests export the System, Application, PowerShell and Setup logs of the machine they run on, and on CI also the Security log, and check that both readers return exactly the same records and values. The demo data runs through the real scanner and summary, only the file reading is simulated.
 
 ## How this was built
 

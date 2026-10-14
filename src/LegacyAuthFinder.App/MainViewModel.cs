@@ -69,7 +69,9 @@ public sealed record KindTile(LegacyKind Kind, string Label, string Count);
 
 public sealed class MainViewModel : INotifyPropertyChanged
 {
-    private readonly WindowsEvtxReader _reader = new();
+    private readonly WindowsEvtxReader _windows = new();
+    private readonly EvtxFileReader _parser;
+    private bool _useWindowsApi;
     private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
     private DiagLog? _log;
     private long _uiUpdates;
@@ -99,6 +101,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public MainViewModel()
     {
+        _parser = new EvtxFileReader(_windows);
         _searchTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
         _searchTimer.Tick += async (_, _) =>
         {
@@ -114,12 +117,30 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public void AttachLog(DiagLog log)
     {
         _log = log;
-        _reader.Log = log;
+        _windows.Log = log;
+        _parser.Log = log;
         OnChanged(nameof(LogPath));
         OnChanged(nameof(HasLog));
     }
 
     public string LogPath => _log?.Path ?? "";
+
+    /// <summary>
+    /// The built-in reader parses the .evtx files itself, one pass per file. The Windows event log API is the
+    /// comparison and fallback: it is filtered by the Event Log service and needs one pass per query.
+    /// </summary>
+    public bool UseWindowsApi
+    {
+        get => _useWindowsApi;
+        set
+        {
+            _useWindowsApi = value;
+            _log?.Write("UI", value ? "Reader: Windows event log API" : "Reader: built-in .evtx reader");
+            OnChanged();
+        }
+    }
+
+    private IEvtxReader Reader => _useWindowsApi ? _windows : _parser;
     public bool HasLog => _log?.IsEnabled == true;
 
     public ObservableCollection<FileRow> Files { get; } = [];
@@ -309,7 +330,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var recurse = Recurse;
             var parallel = Math.Max(4, Threads);
             var log = _log;
-            _inventory = await Task.Run(() => Scanner.Inventory(_reader, folder, recurse, maxParallel: parallel, cancellationToken: token, log: log), token);
+            _inventory = await Task.Run(() => Scanner.Inventory(Reader, folder, recurse, maxParallel: parallel, cancellationToken: token, log: log), token);
             foreach (var f in _inventory) Files.Add(new FileRow(f, folder));
         }
         catch (OperationCanceledException)
@@ -396,9 +417,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _log?.Write("UI", $"Start scan: {relevant.Count} files, {Threads} at once (recommended {_recommended} for {_storage})");
             var probe = _log is null ? null : StartUiProbe(_log, token);
             var inventory = _inventory;
+            var reader = Reader;
             try
             {
-                var result = await Task.Run(() => Scanner.Scan(_reader, inventory, folder, options, progress, token));
+                var result = await Task.Run(() => Scanner.Scan(reader, inventory, folder, options, progress, token));
                 _log?.Write("UI", $"Scan returned: {result.TotalHits:N0} events, {result.Fixes.Count:N0} things to fix, cancelled {result.Cancelled}");
                 Show(result);
             }

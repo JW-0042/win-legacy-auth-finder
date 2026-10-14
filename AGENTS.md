@@ -10,8 +10,10 @@
 ## Rules for the code
 
 - **The tool is read-only.** Never write to the scanned files or folders.
-- **All file access goes through `IEvtxReader`.** The real reader is `WindowsEvtxReader`.
-- **Filter inside the event log API.** Queries are XPath strings in `Queries` (EvtxReader.cs), and fields are read by name with `EventLogPropertySelector`. Do not switch to reading every record or rendering XML for the big Security queries, because it makes 4 GB files slow.
+- **All file access goes through `IEvtxReader`.** The default reader is the built-in parser `EvtxFileReader` (EvtxParser.cs), with `WindowsEvtxReader` as fallback for files that are not `.evtx` and as an option for comparison.
+- **Every query has two forms.** The XPath string is used by the Windows API. `EventIds`, `Providers` and `Filter` are used by the parser and must select exactly the same records. Change both together.
+- **The parser must match the Windows API.** `EvtxParserTests.Every_record_matches_the_windows_api` compares every record and value of real logs. Rules learned from it: the record ID comes from System/EventRecordID (exported files renumber the record headers), null values are not properties, string arrays in unnamed Data elements (classic events) are split into separate properties while named arrays stay one value, a nested template instance under UserData returns all its values, and Int16 comes back as its low byte, HexInt32 as int.
+- **Damaged input is normal.** Every read in `ChunkParser` is bounds-checked against the 64 KB chunk. A damaged record or chunk is skipped and counted in `ReadStats`, never fatal.
 - **Classification lives in `Classifier`.** Every change needs tests in `ClassifierTests` or `NtlmSmbTests`, including cases that must be ignored.
 - **The fix list lives in `Remediation`.** Every summary row becomes exactly one fix item, so the fix list always adds up to the total. Tests in `RemediationTests`.
 - **Diagnostic log.** `DiagLog` writes timings, file names and process counters, never event content (accounts, addresses, services). `ScanMonitor` writes the heartbeat and `STALL` lines. Keep it that way, users send these files for support.

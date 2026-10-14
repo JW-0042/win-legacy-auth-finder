@@ -73,6 +73,14 @@ Building it settled an old question. Measured on a test machine, the Event Log s
 
 The same release added the NTLM Operational log (with the reason Windows logs for every NTLM use), SMBv1 clients from the SMB audit log, and a ranked fix list that says what to change on which client, account or service account. The field names come from the provider manifests on Windows itself, not from blog posts.
 
+## Version 0.4: reading the files ourselves
+
+The diagnostic log answered the question in one run. Nothing was stuck. The Windows Event Log service was using 8 CPU cores and read about 370 MB per second for the NTLMv1 question, then only 95 MB per second for the RC4 question, because it evaluates the XPath filter on every record. Each Security file was read three times, once per question. On 99 GB the scan would have needed most of an hour and looked frozen, because the RC4 pass found nothing for minutes.
+
+So the tool got its own `.evtx` parser. The format is public: a file header, 64 KB chunks with their own string and template tables, records in binary XML. The parser reads each file once, checks the event ID of every record first and decodes the rest only for the events it looks for.
+
+The hard part was not the format but matching Windows exactly. A test exports real logs and compares every record and every value with the Windows API. It found six rules nobody documents, for example that exported files renumber their record headers while the event keeps its original ID, and that Windows returns the low byte of a 16-bit signed number. After those fixes, about 79,000 records from four logs match without a single difference. CI adds the Security log.
+
 ## Quality gates
 
 - The build treats warnings as errors.

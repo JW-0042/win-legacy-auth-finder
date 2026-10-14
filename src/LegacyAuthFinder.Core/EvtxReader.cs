@@ -11,8 +11,11 @@ namespace LegacyAuthFinder.Core;
 /// streamed and only matching records reach .NET. Fields are pulled by name with a property selector, which is
 /// much faster than rendering XML. Fields null means the full EventData is read through XML (used for rare events),
 /// unless <paramref name="Positional"/> is set: then the unnamed insertion strings are read in order, which is fast.
+/// The built-in parser (<see cref="EvtxFileReader"/>) does not use XPath. It applies <paramref name="EventIds"/>,
+/// <paramref name="Providers"/> and <paramref name="Filter"/>, which must select exactly the same records.
 /// </summary>
-public sealed record EvtxQuery(string Name, string Channel, string XPath, IReadOnlyList<string>? Fields, bool Positional = false);
+public sealed record EvtxQuery(string Name, string Channel, string XPath, IReadOnlyList<string>? Fields, bool Positional = false,
+    IReadOnlySet<int>? EventIds = null, IReadOnlyList<string>? Providers = null, Func<IRecordView, bool>? Filter = null);
 
 public interface IEvtxReader
 {
@@ -42,9 +45,17 @@ public static class Queries
 
     private static readonly string[] WeakEtypes = ["0x17", "0x18", "0x1", "0x3"];
 
+    private static IReadOnlySet<int> Ids(params int[] ids) => new HashSet<int>(ids);
+
+    private static IReadOnlySet<int> Range(int from, int to) => new HashSet<int>(Enumerable.Range(from, to - from + 1));
+
+    private static bool Weak(IRecordView v, string field) => Classifier.ParseEtype(v.Get(field)) is 0x17 or 0x18 or 0x1 or 0x3;
+
+    private static bool Is0xE(IRecordView v, string field) => Classifier.ParseEtype(v.Get(field)) == Classifier.EtypeNotSupported;
+
     public static EvtxQuery Ntlmv1 { get; } = new("NTLMv1 logons", Channels.Security,
         "*[System[(EventID=4624 or EventID=4625)] and EventData[Data[@Name='LmPackageName']='NTLM V1' or Data[@Name='LmPackageName']='LM']]",
-        NtlmFields);
+        NtlmFields, EventIds: Ids(4624, 4625), Filter: v => v.Get("LmPackageName") is "NTLM V1" or "LM");
 
     public static EvtxQuery Kerberos { get; } = new("RC4 and DES Kerberos tickets", Channels.Security,
         "*[System[(EventID=4768 or EventID=4769 or EventID=4770)] and EventData["
@@ -54,26 +65,26 @@ public static class Queries
             $"Data[@Name='SessionKeyEncryptionType']='{t}'",
         }))
         + "]]",
-        KerberosFields);
+        KerberosFields, EventIds: Ids(4768, 4769, 4770), Filter: v => Weak(v, "TicketEncryptionType") || Weak(v, "SessionKeyEncryptionType"));
 
     public static EvtxQuery KdcWarnings { get; } = new("KDC RC4 warnings", Channels.System,
         $"*[System[(Provider[@Name='{Providers.KdcSvc}'] or Provider[@Name='{Providers.Kdc}']) and (EventID>=201 and EventID<=209)]]",
-        null);
+        null, EventIds: Range(201, 209), Providers: [Providers.KdcSvc, Providers.Kdc]);
 
     // KDC_ERR_ETYPE_NOSUPP. Hex values are rendered in lower case, the upper case variant is only a safety net.
     public static EvtxQuery KerberosEtypeFailures { get; } = new("Kerberos encryption type failures", Channels.Security,
         "*[System[(EventID=4768 or EventID=4769 or EventID=4771)] and EventData["
         + "Data[@Name='Status']='0xe' or Data[@Name='Status']='0xE' or Data[@Name='FailureCode']='0xe' or Data[@Name='FailureCode']='0xE']]",
-        KerberosFailureFields);
+        KerberosFailureFields, EventIds: Ids(4768, 4769, 4771), Filter: v => Is0xE(v, "Status") || Is0xE(v, "FailureCode"));
 
     public static EvtxQuery KdcEtypeErrors { get; } = new("KDC encryption type errors", Channels.System,
         $"*[System[Provider[@Name='{Providers.Kdc}'] and (EventID=14 or EventID=16 or EventID=26 or EventID=27)]]",
-        null, Positional: true);
+        null, Positional: true, EventIds: Ids(14, 16, 26, 27), Providers: [Providers.Kdc]);
 
     // Logged on domain controllers. 2889 needs the "16 LDAP Interface Events" diagnostic value set to 2.
     public static EvtxQuery Ldap { get; } = new("LDAP signing and channel binding", Channels.DirectoryService,
         "*[System[(EventID=2887 or EventID=2889 or EventID=3039 or EventID=3074 or EventID=3075)]]",
-        null, Positional: true);
+        null, Positional: true, EventIds: Ids(2887, 2889, 3039, 3074, 3075));
 
     // Field names taken from the provider manifests (Get-WinEvent -ListProvider). XPath compares names case-sensitively,
     // so both spellings Microsoft uses (Username in 4020 to 4023, UserName in 4024, 4025 and 8001 to 8004) are listed.
@@ -91,11 +102,11 @@ public static class Queries
     // single sign-on. The older "Restrict NTLM" audit events 8001 to 8004 are read as well.
     public static EvtxQuery NtlmOperational { get; } = new("NTLM use", Channels.NtlmOperational,
         "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4020 and EventID<=4025) or (EventID>=4030 and EventID<=4033))]]",
-        NtlmOperationalFields);
+        NtlmOperationalFields, EventIds: new HashSet<int>([.. Enumerable.Range(8001, 4), .. Enumerable.Range(4020, 6), .. Enumerable.Range(4030, 4)]));
 
     // Logged only after Set-SmbServerConfiguration -AuditSmb1Access $true.
     public static EvtxQuery Smb1 { get; } = new("SMBv1 access", Channels.SmbServerAudit,
-        "*[System[EventID=3000]]", ["ClientName"]);
+        "*[System[EventID=3000]]", ["ClientName"], EventIds: Ids(3000));
 
     public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KerberosEtypeFailures, KdcWarnings, KdcEtypeErrors, Ldap, NtlmOperational, Smb1];
 

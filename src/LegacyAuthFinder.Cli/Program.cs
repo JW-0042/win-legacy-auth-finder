@@ -1,15 +1,15 @@
 using LegacyAuthFinder.Core;
 
-// legacy-auth-scan <folder> [--no-recurse] [--threads n] [--events-csv f] [--summary-csv f] [--fix-csv f] [--json f] [--html f] [--log f | --no-log] [--quiet]
+// legacy-auth-scan <folder> [--no-recurse] [--threads n] [--events-csv f] [--summary-csv f] [--fix-csv f] [--json f] [--html f] [--log f | --no-log] [--windows-api] [--quiet]
 // Exit codes: 0 = nothing found, 1 = NTLMv1, RC4 or DES found, 2 = invalid arguments, 3 = no readable log files.
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
 
-const string Usage = "Usage: legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--log <file> | --no-log] [--quiet]";
+const string Usage = "Usage: legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--log <file> | --no-log] [--windows-api] [--quiet]";
 
 string? folder = null, eventsCsv = null, summaryCsv = null, fixCsv = null, jsonPath = null, htmlPath = null, logPath = null;
-bool recurse = true, quiet = false, demo = false, noLog = false;
+bool recurse = true, quiet = false, demo = false, noLog = false, windowsApi = false;
 int? threads = null;
 for (var i = 0; i < args.Length; i++)
 {
@@ -22,6 +22,7 @@ for (var i = 0; i < args.Length; i++)
         case "--fix-csv" when i + 1 < args.Length: fixCsv = args[++i]; break;
         case "--log" when i + 1 < args.Length: logPath = args[++i]; break;
         case "--no-log": noLog = true; break;
+        case "--windows-api": windowsApi = true; break;
         case "--json" when i + 1 < args.Length: jsonPath = args[++i]; break;
         case "--html" when i + 1 < args.Length: htmlPath = args[++i]; break;
         case "--quiet": quiet = true; break;
@@ -54,7 +55,8 @@ else
         return 2;
     }
 
-    var reader = new WindowsEvtxReader { Log = log };
+    var windows = new WindowsEvtxReader { Log = log };
+    IEvtxReader reader = windowsApi ? windows : new EvtxFileReader(windows) { Log = log };
     var storage = Storage.Detect(folder);
     log?.Write("FOLDER", $"{Path.GetFullPath(folder)}: storage {storage}, {Storage.Explain(folder)}");
     threads ??= Storage.RecommendedThreads(storage);
