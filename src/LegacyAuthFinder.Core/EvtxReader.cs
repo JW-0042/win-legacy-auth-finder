@@ -112,11 +112,12 @@ public static class Queries
     // Enhanced NTLM auditing (Windows 11 24H2, Windows Server 2025, Server 2019 and 2022 from the October 2026 updates):
     // 4020 to 4023 on clients and servers, 4030 to 4033 on domain controllers, 4024 and 4025 for NTLMv1-derived
     // single sign-on, 4026 and 4027 for NTLM that would be or was blocked. 4013 is a failed NTLMv1 attempt.
-    // The "Restrict NTLM" events are read as well: 8001 to 8004 in audit mode, 4001 to 4003 when blocking.
+    // The "Restrict NTLM" events are read as well: 8001 to 8004 in audit mode, 4001 to 4006 when blocking (4004 to 4006
+    // are the domain controller's own, from Security-Netlogon).
     public static EvtxQuery NtlmOperational { get; } = new("NTLM use", Channels.NtlmOperational,
-        "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4001 and EventID<=4003) or EventID=4013"
+        "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4001 and EventID<=4006) or EventID=4013"
         + " or (EventID>=4020 and EventID<=4027) or (EventID>=4030 and EventID<=4033))]]",
-        NtlmOperationalFields, EventIds: new HashSet<int>([.. Enumerable.Range(8001, 4), .. Enumerable.Range(4001, 3), 4013, .. Enumerable.Range(4020, 8), .. Enumerable.Range(4030, 4)]));
+        NtlmOperationalFields, EventIds: new HashSet<int>([.. Enumerable.Range(8001, 4), .. Enumerable.Range(4001, 6), 4013, .. Enumerable.Range(4020, 8), .. Enumerable.Range(4030, 4)]));
 
     // Logged only after Set-SmbServerConfiguration -AuditSmb1Access $true.
     public static EvtxQuery Smb1 { get; } = new("SMBv1 access", Channels.SmbServerAudit,
@@ -138,7 +139,7 @@ public sealed class WindowsEvtxReader : IEvtxReader
 
     private static readonly HashSet<string> HexFields = new(StringComparer.Ordinal)
     {
-        "TicketEncryptionType", "SessionKeyEncryptionType", "TicketOptions", "Status", "SubStatus", "FailureCode",
+        "TicketEncryptionType", "SessionKeyEncryptionType", "PreAuthEncryptionType", "TicketOptions", "Status", "SubStatus", "FailureCode",
     };
 
     public LogFileInfo Inspect(string path)

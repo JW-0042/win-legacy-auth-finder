@@ -176,8 +176,11 @@ public sealed class EvtxParserTests(ITestOutputHelper output) : IDisposable
         var bad = Path.Combine(_dir, "not-evtx.evtx");
         File.WriteAllText(bad, "this is not an event log");
         var stats = new ReadStats();
-        Assert.Throws<EventLogException>(() => new EvtxFileReader(new WindowsEvtxReader()).ReadAll(bad, [Queries.Ntlmv1], CancellationToken.None, null, stats).ToList());
+        // The Windows API cannot read it either: every query is counted as failed and the file as partly read.
+        Assert.Empty(new EvtxFileReader(new WindowsEvtxReader()).ReadAll(bad, [Queries.Ntlmv1, Queries.Kerberos], CancellationToken.None, null, stats));
         Assert.NotNull(stats.Fallback);
+        Assert.Equal(2, stats.FailedQueries);
+        Assert.True(stats.Partial);
         Assert.Throws<EvtxFormatException>(() => new EvtxFileReader().ReadAll(bad, [Queries.Ntlmv1], CancellationToken.None).ToList());
         Assert.NotNull(new EvtxFileReader().Inspect(bad).Error);
     }

@@ -141,20 +141,30 @@ public sealed record AuthEvent(
     }
 }
 
-/// <summary>Grouping key of the summary. Account, client and service compare case-insensitively.</summary>
-public readonly record struct SummaryKey(LegacyKind Kind, string Account, string Client, string Service)
+/// <summary>
+/// Grouping key of the summary. Account, client and service compare case-insensitively. Group keeps events apart that
+/// need different fixes although they name the same parties: each KDCSVC event ID (201 to 209) gets its own row.
+/// </summary>
+public readonly record struct SummaryKey(LegacyKind Kind, string Account, string Client, string Service, string Group = "")
 {
     public static IEqualityComparer<SummaryKey> Comparer { get; } = new KeyComparer();
+
+    public static string GroupOf(AuthEvent e) =>
+        e.Variant.StartsWith("KDC event ", StringComparison.Ordinal) ? e.Variant : "";
+
+    /// <summary>The summary row an event belongs to.</summary>
+    public static SummaryKey Of(AuthEvent e) => new(e.Kind, e.Account, e.Client, e.Service, GroupOf(e));
 
     private sealed class KeyComparer : IEqualityComparer<SummaryKey>
     {
         private static readonly StringComparer Text = StringComparer.OrdinalIgnoreCase;
 
         public bool Equals(SummaryKey a, SummaryKey b) =>
-            a.Kind == b.Kind && Text.Equals(a.Account, b.Account) && Text.Equals(a.Client, b.Client) && Text.Equals(a.Service, b.Service);
+            a.Kind == b.Kind && Text.Equals(a.Account, b.Account) && Text.Equals(a.Client, b.Client) && Text.Equals(a.Service, b.Service)
+            && string.Equals(a.Group, b.Group, StringComparison.Ordinal);
 
         public int GetHashCode(SummaryKey k) =>
-            HashCode.Combine(k.Kind, Text.GetHashCode(k.Account), Text.GetHashCode(k.Client), Text.GetHashCode(k.Service));
+            HashCode.Combine(k.Kind, Text.GetHashCode(k.Account), Text.GetHashCode(k.Client), Text.GetHashCode(k.Service), k.Group);
     }
 }
 
@@ -163,16 +173,17 @@ public sealed class SummaryRow
 {
     public static void Add(Dictionary<SummaryKey, SummaryRow> rows, AuthEvent e)
     {
-        var key = new SummaryKey(e.Kind, e.Account, e.Client, e.Service);
+        var key = SummaryKey.Of(e);
         if (!rows.TryGetValue(key, out var row))
         {
-            row = new SummaryRow { Kind = e.Kind, Account = e.Account, Client = e.Client, Service = e.Service };
+            row = new SummaryRow { Kind = e.Kind, Account = e.Account, Client = e.Client, Service = e.Service, Group = key.Group };
             rows[key] = row;
         }
         row.Count++;
         if (e.Time < row.FirstSeen) row.FirstSeen = e.Time;
         if (e.Time > row.LastSeen) row.LastSeen = e.Time;
         if (e.Computer.Length > 0) row.Computers.Add(e.Computer);
+        if (e.Domain.Length > 0) row.Domains.Add(e.Domain);
         row.Variants.Add(e.Variant);
     }
 
@@ -183,6 +194,7 @@ public sealed class SummaryRow
         if (other.FirstSeen < FirstSeen) FirstSeen = other.FirstSeen;
         if (other.LastSeen > LastSeen) LastSeen = other.LastSeen;
         Computers.UnionWith(other.Computers);
+        Domains.UnionWith(other.Domains);
         Variants.UnionWith(other.Variants);
     }
 
@@ -190,12 +202,23 @@ public sealed class SummaryRow
     public required string Account { get; init; }
     public required string Client { get; init; }
     public required string Service { get; init; }
+    public string Group { get; init; } = "";
+    public SummaryKey Key => new(Kind, Account, Client, Service, Group);
     public long Count { get; set; }
     public DateTime FirstSeen { get; set; } = DateTime.MaxValue;
     public DateTime LastSeen { get; set; } = DateTime.MinValue;
     // Hash sets: cheaper than sorted sets for hundreds of thousands of rows. The text properties sort when shown.
     public HashSet<string> Computers { get; } = new(StringComparer.OrdinalIgnoreCase);
     public HashSet<string> Variants { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Domains the account was logged with. The same name in two domains is two different accounts.</summary>
+    public HashSet<string> Domains { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public string DomainsText => string.Join(", ", Domains.Order(StringComparer.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// True when the domains are really different, not just NetBIOS and DNS names of one domain (CONTOSO, contoso.local).
+    /// </summary>
+    public bool SeveralDomains => Domains.Select(d => d.Split('.')[0]).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1;
 
     public string KindLabel => Guidance.Label(Kind);
     public string ComputersText => string.Join(", ", Computers.Order(StringComparer.OrdinalIgnoreCase));

@@ -18,6 +18,9 @@ public static class Scanner
     /// <summary>Rough memory of one kept event with its detail fields, used to lower the limit on small machines.</summary>
     private const long BytesPerEvent = 800;
 
+    /// <summary>Events a file collects before they go to the shared list, so a big file does not hold millions on its own.</summary>
+    private const int EventBatch = 65_536;
+
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan LongGap = TimeSpan.FromSeconds(2);
 
@@ -56,13 +59,16 @@ public static class Scanner
         });
         log?.Write("FOLDER", $"Inventory done in {clock.Elapsed.TotalSeconds:0.0} s: {result.Count(f => f.IsRelevant)} files to scan, "
             + $"{Reports.SizeText(result.Where(f => f.IsRelevant).Sum(f => f.Size))} in total, {result.Count(f => f.Error is not null)} unreadable");
-        foreach (var (a, b) in Overlaps(result)) log?.Write("FOLDER", $"OVERLAP: {a.Name} and {b.Name} contain the same records of {a.Computer} {a.Channel}, duplicates are counted once");
+        // File names only: the computer name stays out of the log like in the FILE lines.
+        foreach (var (a, b) in Overlaps(result)) log?.Write("FOLDER", $"OVERLAP: {a.Name} and {b.Name} contain the same records of one log, duplicates are counted once");
         return result;
     }
 
     /// <summary>
-    /// Pairs of files of the same computer and log whose record ID ranges overlap: cumulative exports or an archive
-    /// next to a copy of the live log. Their shared records must be counted once.
+    /// Pairs of files of the same computer and log whose record ID ranges and time ranges overlap: cumulative exports or
+    /// an archive next to a copy of the live log. Their shared records must be counted once. Record IDs start again at 1
+    /// when a log is cleared or a domain controller is rebuilt, so an old archive and a new log with the same IDs but
+    /// different times are not an overlap.
     /// </summary>
     public static IEnumerable<(LogFileInfo A, LogFileInfo B)> Overlaps(IEnumerable<LogFileInfo> files)
     {
@@ -72,9 +78,34 @@ public static class Scanner
             var list = group.OrderBy(f => f.FirstRecordId).ToList();
             for (var i = 0; i < list.Count; i++)
             {
-                for (var j = i + 1; j < list.Count && list[j].FirstRecordId <= list[i].LastRecordId; j++) yield return (list[i], list[j]);
+                for (var j = i + 1; j < list.Count && list[j].FirstRecordId <= list[i].LastRecordId; j++)
+                {
+                    if (TimesOverlap(list[i], list[j])) yield return (list[i], list[j]);
+                }
             }
         }
+    }
+
+    private static bool TimesOverlap(LogFileInfo a, LogFileInfo b) =>
+        a.First is null || a.Last is null || b.First is null || b.Last is null || (a.First <= b.Last && b.First <= a.Last);
+
+    /// <summary>The record IDs a file shares with other files, and a number for its computer and log.</summary>
+    internal static Dictionary<string, (int Group, List<(long From, long To)> Ranges)> SharedRanges(IEnumerable<LogFileInfo> files)
+    {
+        var shared = new Dictionary<string, (int, List<(long, long)>)>(StringComparer.Ordinal);
+        var groups = new Dictionary<(string, string), int>();
+        foreach (var (a, b) in Overlaps(files))
+        {
+            var key = (a.Computer.ToUpperInvariant(), a.Channel.ToUpperInvariant());
+            if (!groups.TryGetValue(key, out var group)) groups[key] = group = groups.Count;
+            var range = (Math.Max(a.FirstRecordId, b.FirstRecordId), Math.Min(a.LastRecordId, b.LastRecordId));
+            foreach (var f in new[] { a, b })
+            {
+                if (!shared.TryGetValue(f.Path, out var entry)) shared[f.Path] = entry = (group, []);
+                entry.Item2.Add(range);
+            }
+        }
+        return shared;
     }
 
     /// <summary>Lower than <paramref name="wanted"/> on machines without enough memory for it.</summary>
@@ -103,9 +134,13 @@ public static class Scanner
         var limit = EventLimit(options.MaxEvents);
         var events = new List<AuthEvent>();
         var summary = new Dictionary<SummaryKey, SummaryRow>(SummaryKey.Comparer);
-        var results = new ConcurrentDictionary<string, FileProgress>(StringComparer.OrdinalIgnoreCase);
-        var work = new ConcurrentDictionary<string, FileWork>(StringComparer.OrdinalIgnoreCase);
-        var seen = new ConcurrentDictionary<(string, string, long), byte>();
+        // Paths compare exactly: a case-sensitive folder can hold Security.evtx and security.evtx.
+        var results = new ConcurrentDictionary<string, FileProgress>(StringComparer.Ordinal);
+        var work = new ConcurrentDictionary<string, FileWork>(StringComparer.Ordinal);
+        // Records of overlapping files already counted: log, record ID and time (IDs alone repeat after a log is cleared).
+        var seen = new ConcurrentDictionary<(int, long, long), byte>();
+        // Events older than this can no longer be among the newest ones the list keeps. Set once the list is full.
+        long cutoff = long.MinValue;
         long total = 0;
         long duplicates = 0;
         long matched = 0;
@@ -119,19 +154,31 @@ public static class Scanner
             progress?.Report(p);
         }
 
-        // Each file builds its own summary and event list without any locking. They are merged once, when the file
-        // is finished. A shared lock per event made 16 parallel files no faster than 2.
-        void Merge(Dictionary<SummaryKey, SummaryRow> local, List<AuthEvent> localEvents, long hits)
+        // Each file builds its own summary without any locking and merges it once, when the file is finished. Events go
+        // to the shared list in batches, so the memory stays near the limit however many files run at once. A shared
+        // lock per event made 16 parallel files no faster than 2.
+        void Flush(List<AuthEvent> localEvents)
         {
+            if (localEvents.Count == 0) return;
             lock (gate)
             {
-                total += hits;
                 events.AddRange(localEvents);
                 if (events.Count > limit * 2L)
                 {
                     KeepNewest(events, limit);
+                    Volatile.Write(ref cutoff, events[^1].Time.Ticks);
                     Volatile.Write(ref truncated, 1);
                 }
+            }
+            localEvents.Clear();
+        }
+
+        void Merge(Dictionary<SummaryKey, SummaryRow> local, List<AuthEvent> localEvents, long hits)
+        {
+            Flush(localEvents);
+            lock (gate)
+            {
+                total += hits;
                 foreach (var (key, row) in local)
                 {
                     if (summary.TryGetValue(key, out var existing)) existing.Absorb(row);
@@ -152,14 +199,14 @@ public static class Scanner
             work[relevant[i].Path] = new FileWork(relevant[i], i + 1);
             Report(new FileProgress(relevant[i].Path, FileState.Queued, 0, null, "Waiting"));
         }
-        // Only files whose record ranges overlap another file of the same log need the duplicate check.
-        var overlapping = new HashSet<string>(Overlaps(relevant).SelectMany(p => new[] { p.A.Path, p.B.Path }), StringComparer.OrdinalIgnoreCase);
+        // Only the records a file shares with another file of the same log need the duplicate check.
+        var shared = SharedRanges(relevant);
 
         var threads = Math.Max(1, options.Threads);
         var mode = reader is IMultiQueryReader ? "built-in .evtx reader, one pass per file" : "Windows event log API, one pass per query";
         if (reader is EvtxFileReader parser) parser.ChunkWorkers = Math.Clamp(Environment.ProcessorCount / threads, 1, 8);
         log?.Write("SCAN", $"Start: {relevant.Count} files, {Reports.SizeText(relevant.Sum(f => f.Size))}, {threads} at once, {mode}"
-            + $"{(reader is EvtxFileReader p2 ? $", {p2.ChunkWorkers} chunk workers per file" : "")}, event list limit {limit:N0}, {overlapping.Count} files with overlapping records");
+            + $"{(reader is EvtxFileReader p2 ? $", {p2.ChunkWorkers} chunk workers per file" : "")}, event list limit {limit:N0}, {shared.Count} files with overlapping records");
         foreach (var f in relevant)
         {
             log?.Write("SCAN", $"  [{work[f.Path].Order:00}] {f.Name} {Reports.SizeText(f.Size)} '{f.Channel}': {string.Join(", ", Queries.For(f.Channel).Select(q => q.Name))}");
@@ -206,7 +253,7 @@ public static class Scanner
                 var localEvents = new List<AuthEvent>();
                 // Only the Windows API path can return a record twice within one file (two queries that both match).
                 var localSeen = reader is IMultiQueryReader ? null : new HashSet<long>();
-                var checkOverlap = overlapping.Contains(file.Path);
+                var (group, ranges) = shared.TryGetValue(file.Path, out var mine) ? mine : (-1, null);
                 long hits = 0;
                 var lastReport = Stopwatch.StartNew();
                 var fileNote = "";
@@ -219,9 +266,9 @@ public static class Scanner
                     w.LastRecordId = raw.RecordId;
                     if (raw.RecordId > 0)
                     {
-                        // The same record can come from two queries (Windows API path) or from two overlapping files.
-                        if ((localSeen is not null && !localSeen.Add(raw.RecordId))
-                            || (checkOverlap && !seen.TryAdd((raw.Computer.ToUpperInvariant(), file.Channel, raw.RecordId), 0)))
+                        // Two queries of the Windows API path can return the same record: not a duplicate between files.
+                        if (localSeen is not null && !localSeen.Add(raw.RecordId)) return;
+                        if (ranges is not null && InRanges(ranges, raw.RecordId) && !seen.TryAdd((group, raw.RecordId, raw.Time.Ticks), 0))
                         {
                             Interlocked.Increment(ref duplicates);
                             return;
@@ -233,12 +280,14 @@ public static class Scanner
                     w.Hits = hits;
                     Interlocked.Increment(ref matched);
                     SummaryRow.Add(local, e);
-                    localEvents.Add(e);
-                    if (localEvents.Count >= limit * 2L)
+                    if (e.Time.Ticks < Volatile.Read(ref cutoff))
                     {
-                        KeepNewest(localEvents, limit);
+                        // Counted in the summary, but too old for the event list.
                         Volatile.Write(ref truncated, 1);
+                        return;
                     }
+                    localEvents.Add(e);
+                    if (localEvents.Count >= EventBatch) Flush(localEvents);
                 }
 
                 try
@@ -267,7 +316,8 @@ public static class Scanner
                             }
                             w.Life();
                             if (lastReport.Elapsed <= ProgressInterval) return;
-                            Report(new FileProgress(file.Path, FileState.Scanning, hits, share >= 0 ? fraction : null,
+                            // A sign of life without a new share keeps the last share, so the bar does not jump back.
+                            Report(new FileProgress(file.Path, FileState.Scanning, hits, fraction,
                                 hits == 0 ? $"Reading, nothing found yet ({fraction:P0})" : $"Reading, {hits:N0} found ({fraction:P0})"));
                             lastReport.Restart();
                         }
@@ -280,9 +330,16 @@ public static class Scanner
                         var passSeconds = passClock.Elapsed.TotalSeconds;
                         log?.Write("PARSE", $"[{w.Order:00}] {file.Name}: {passSeconds:0.0} s, "
                             + $"{(stats.Fallback is null ? $"{stats.Bytes / 1048576.0 / Math.Max(0.001, passSeconds):0} MB/s, " : "")}{stats}");
-                        if (stats.BadChunks > 0 || stats.BadRecords > 0)
+                        if (stats.Partial)
                         {
-                            fileNote = $", skipped {stats.BadChunks:N0} damaged chunks and {stats.BadRecords:N0} unreadable records";
+                            // Missing parts can hold findings, so the file counts as partly read and the result as incomplete.
+                            partly = true;
+                            var parts = new List<string>();
+                            if (stats.BadChunks > 0) parts.Add($"{stats.BadChunks:N0} damaged chunks skipped");
+                            if (stats.BadRecords > 0) parts.Add($"{stats.BadRecords:N0} unreadable records skipped");
+                            if (stats.MissingBytes > 0) parts.Add($"the file is cut off, {Reports.SizeText(stats.MissingBytes)} missing");
+                            if (stats.FailedQueries > 0) parts.Add($"{stats.FailedQueries} of {queries.Count} queries failed");
+                            fileNote = ", " + string.Join(", ", parts);
                         }
                     }
                     else
@@ -295,6 +352,7 @@ public static class Scanner
                             var queryClock = Stopwatch.StartNew();
                             long queryRecords = 0, querySlices = 0;
                             var firstLife = TimeSpan.Zero;
+                            double? lastShare = (double)queryIndex / queries.Count;
                             w.Query = query.Name;
                             w.Enter("reading");
                             w.Life();
@@ -317,7 +375,7 @@ public static class Scanner
                                 Interlocked.Increment(ref w.Slices);
                                 Gap();
                                 if (lastReport.Elapsed <= ProgressInterval) return;
-                                Report(new FileProgress(file.Path, FileState.Scanning, hits, null,
+                                Report(new FileProgress(file.Path, FileState.Scanning, hits, lastShare,
                                     hits == 0 ? $"{query.Name}: reading, nothing matched yet" : $"{query.Name}: reading, {hits:N0} found so far"));
                                 lastReport.Restart();
                             }
@@ -332,8 +390,8 @@ public static class Scanner
                                     if (lastReport.Elapsed > ProgressInterval)
                                     {
                                         // Every query reads the file from the start, so its share is scaled into the file's total.
-                                        var share = Percent(file, raw.RecordId) is { } pct ? (queryIndex + pct) / queries.Count : (double?)null;
-                                        Report(new FileProgress(file.Path, FileState.Scanning, hits, share, $"{query.Name}: {hits:N0} found"));
+                                        if (Percent(file, raw.RecordId) is { } pct) lastShare = (queryIndex + pct) / queries.Count;
+                                        Report(new FileProgress(file.Path, FileState.Scanning, hits, lastShare, $"{query.Name}: {hits:N0} found"));
                                         lastReport.Restart();
                                     }
                                 }
@@ -428,6 +486,15 @@ public static class Scanner
     internal static string Describe(Exception ex) => ex is System.Xml.XmlException or System.Text.DecoderFallbackException
         ? ex.GetType().Name
         : $"{ex.GetType().Name}: {ex.Message.Trim()}{Environment.NewLine}{ex.StackTrace}";
+
+    private static bool InRanges(List<(long From, long To)> ranges, long id)
+    {
+        foreach (var (from, to) in ranges)
+        {
+            if (id >= from && id <= to) return true;
+        }
+        return false;
+    }
 
     internal static bool IsIdle(string phase) => phase is "queued" or "done" or "cancelled" or "error";
 

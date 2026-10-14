@@ -141,7 +141,7 @@ public class ScannerTests
     [Theory]
     [InlineData(StorageKind.Hdd, 2)]
     [InlineData(StorageKind.Network, 2)]
-    [InlineData(StorageKind.Unknown, 4)]
+    [InlineData(StorageKind.Unknown, 2)]
     public void Recommended_threads_follow_the_disk(StorageKind kind, int expected) => Assert.Equal(expected, Storage.RecommendedThreads(kind));
 
     [Fact]
@@ -191,7 +191,7 @@ public class ReportTests
         Assert.Equal(r.Events.Count + 1, events.ToString().TrimEnd().Split('\n').Length);
         using var summary = new StringWriter();
         Reports.WriteSummaryCsv(summary, r.Summary);
-        Assert.StartsWith("Type,Account,Client", summary.ToString());
+        Assert.StartsWith("Type,Account,Domains,Client", summary.ToString());
     }
 
     [Fact]

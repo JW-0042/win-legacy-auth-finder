@@ -12,7 +12,8 @@ namespace LegacyAuthFinder.Tests;
 /// </summary>
 internal sealed class EvtxWriter
 {
-    public sealed record Field(string Name, byte Type, byte[] Value);
+    /// <summary>A Data element. A null name writes an unnamed Data element, like classic events have.</summary>
+    public sealed record Field(string? Name, byte Type, byte[] Value);
 
     public sealed record Record(long Id, int EventId, string Provider, IReadOnlyList<Field> Data, string Channel = "Security", string Computer = "DC01.lab.local");
 
@@ -180,8 +181,15 @@ internal sealed class EvtxWriter
                 for (var i = 0; i < r.Data.Count; i++)
                 {
                     var name = r.Data[i].Name;
-                    Start("Data", true);
-                    Attribute("Name", () => Text(name));
+                    if (name is null)
+                    {
+                        Start("Data", false);
+                    }
+                    else
+                    {
+                        Start("Data", true);
+                        Attribute("Name", () => Text(name));
+                    }
                     B(0x02);
                     Sub(6 + i, r.Data[i].Type);
                     B(0x04);
@@ -241,12 +249,18 @@ internal sealed class EvtxWriter
     }
 
     /// <summary>Finishes the chunk: header fields, free space offset and the records checksum.</summary>
-    public byte[] Chunk(long firstNumber = 1, int? free = null)
+    /// <param name="firstId">The first record ID in the chunk header (offset 24). Windows writes it, older tests leave it 0.</param>
+    public byte[] Chunk(long firstNumber = 1, int? free = null, long firstId = 0)
     {
         Free = free ?? _p;
         "ElfChnk\0"u8.CopyTo(_c);
         BinaryPrimitives.WriteUInt64LittleEndian(_c.AsSpan(8), (ulong)firstNumber);
         BinaryPrimitives.WriteUInt64LittleEndian(_c.AsSpan(16), (ulong)(firstNumber + RecordOffsets.Count - 1));
+        if (firstId > 0)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(_c.AsSpan(24), (ulong)firstId);
+            BinaryPrimitives.WriteUInt64LittleEndian(_c.AsSpan(32), (ulong)(firstId + RecordOffsets.Count - 1));
+        }
         BinaryPrimitives.WriteUInt32LittleEndian(_c.AsSpan(40), 128);
         BinaryPrimitives.WriteUInt32LittleEndian(_c.AsSpan(44), (uint)(RecordOffsets.Count > 0 ? RecordOffsets[^1] : 0));
         BinaryPrimitives.WriteUInt32LittleEndian(_c.AsSpan(48), (uint)Free);
@@ -254,12 +268,15 @@ internal sealed class EvtxWriter
         return _c;
     }
 
-    public static byte[] File(long oldestChunk, params byte[][] chunks)
+    public static byte[] File(long oldestChunk, params byte[][] chunks) => File(oldestChunk, (oldestChunk + chunks.Length - 1) % chunks.Length, chunks);
+
+    /// <summary>A file whose header names any oldest and newest chunk, also stale ones like a log copied while Windows wrote it.</summary>
+    public static byte[] File(long oldestChunk, long newestChunk, params byte[][] chunks)
     {
         var file = new byte[EvtxFileReader.HeaderSize + chunks.Length * EvtxFileReader.ChunkSize];
         "ElfFile\0"u8.CopyTo(file);
         BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(8), (ulong)oldestChunk);
-        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), (ulong)((oldestChunk + chunks.Length - 1) % chunks.Length));
+        BinaryPrimitives.WriteUInt64LittleEndian(file.AsSpan(16), (ulong)newestChunk);
         BinaryPrimitives.WriteUInt32LittleEndian(file.AsSpan(32), 128);
         BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(36), 2);
         BinaryPrimitives.WriteUInt16LittleEndian(file.AsSpan(38), 3);
@@ -322,10 +339,13 @@ public sealed class CraftedEvtxTests(ITestOutputHelper output) : IDisposable
         output.WriteLine(stats.ToString());
         Assert.Single(found);
         Assert.Equal(1, stats.BadRecords);
-        // The scanner keeps going as well.
+        // The scanner keeps going as well, and says the file was only partly read.
         var info = new EvtxFileReader().Inspect(path);
         var result = Scanner.Scan(new EvtxFileReader(), [info], "t", new ScanOptions());
-        Assert.Equal(FileState.Done, result.FileResults[path].State);
+        Assert.Equal(FileState.Error, result.FileResults[path].State);
+        Assert.Contains("unreadable records skipped", result.FileResults[path].Message);
+        Assert.Equal(1, result.TotalHits);
+        Assert.True(result.Incomplete);
     }
 
     [Fact]
@@ -395,7 +415,8 @@ public sealed class CraftedEvtxTests(ITestOutputHelper output) : IDisposable
     {
         Assert.Equal([(1L, 2), (0L, 1)], EvtxFileReader.Blocks(3, 1));
         Assert.Equal([(0L, 3)], EvtxFileReader.Blocks(3, 0));
-        Assert.Equal([(0L, 3)], EvtxFileReader.Blocks(3, 7));
+        // A header number past the end counts around the file.
+        Assert.Equal([(1L, 2), (0L, 1)], EvtxFileReader.Blocks(3, 7));
         var older = new EvtxWriter().Add(Rc4(10)).Chunk(firstNumber: 10);
         var newer = new EvtxWriter().Add(Rc4(20)).Chunk(firstNumber: 20);
         // Physical order: newer first, the header names chunk 1 (older) as the oldest.

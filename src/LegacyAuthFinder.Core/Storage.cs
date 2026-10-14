@@ -111,7 +111,8 @@ public static class Storage
         StorageKind.Ssd => Math.Clamp(Environment.ProcessorCount, 2, 8),
         StorageKind.Hdd => 2,
         StorageKind.Network => 2,
-        _ => 4,
+        // Unknown: some USB bridges and storage pools do not answer the query. Read it like a hard disk to be safe.
+        _ => 2,
     };
 
     public static string Describe(StorageKind kind) => kind switch
@@ -119,7 +120,7 @@ public static class Storage
         StorageKind.Ssd => "This folder is on an SSD. Up to 8 files at once is fine.",
         StorageKind.Hdd => "This folder is on a hard disk. 2 files at once is fastest, more makes the disk seek between files and the whole scan slower.",
         StorageKind.Network => "This folder is on a network share. Start with 2 files at once and raise it only if the share keeps up.",
-        _ => "Could not tell what kind of disk this is. 4 files at once is a safe start.",
+        _ => "Could not tell what kind of disk this is, so it is read like a hard disk: 2 files at once. Raise it if the folder is on an SSD.",
     };
 
     private const uint IoctlVolumeGetDiskExtents = 0x560000;

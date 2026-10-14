@@ -23,6 +23,9 @@ public sealed class FixItem
     public required string Action { get; init; }
     public long Events { get; internal set; }
     public int Rows { get; internal set; }
+
+    /// <summary>The summary rows behind this item, so "Show these events" can show exactly their events.</summary>
+    public List<SummaryRow> SourceRows { get; } = [];
     public DateTime FirstSeen { get; internal set; } = DateTime.MaxValue;
     public DateTime LastSeen { get; internal set; } = DateTime.MinValue;
     public SortedSet<string> Accounts { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -80,6 +83,10 @@ public static class Remediation
         {
             var (type, target, problem, action) = Rule(row);
             if (target.Length == 0) target = Unknown;
+            if (row.SeveralDomains && row.Account.Length > 0)
+            {
+                action += $" The name {row.Account} was logged in more than one domain ({row.DomainsText}). These are different accounts: check each one.";
+            }
             var key = (row.Kind, type, target, problem);
             if (!items.TryGetValue(key, out var item))
             {
@@ -87,6 +94,7 @@ public static class Remediation
                 items[key] = item;
             }
             item.Rows++;
+            item.SourceRows.Add(row);
             item.Events += row.Count;
             if (row.FirstSeen < item.FirstSeen) item.FirstSeen = row.FirstSeen;
             if (row.LastSeen > item.LastSeen) item.LastSeen = row.LastSeen;
@@ -104,30 +112,53 @@ public static class Remediation
         return list;
     }
 
-    /// <summary>Computer accounts end with $. Their encryption types come from the computer's own Kerberos policy.</summary>
+    /// <summary>
+    /// Names that end with $ are computer accounts or managed service accounts (gMSA, sMSA). The event alone cannot
+    /// tell them apart, so the advice covers both.
+    /// </summary>
     internal static bool IsComputer(string account) => account.EndsWith('$');
 
-    private const string ComputerAction =
-        "This is a computer account. Windows sets its msDS-SupportedEncryptionTypes itself from the computer's policy \"Network security: Configure encryption types allowed for Kerberos\", "
-        + "so a manual change is overwritten. Allow AES in that policy on the computer, and update or replace an operating system that cannot use AES. "
-        + "If its password is very old, reset the machine password (Reset-ComputerMachinePassword).";
+    /// <summary>A failed service ticket request names the SPN (HOST/vm01.contoso.com), a successful one the account.</summary>
+    internal static bool IsSpn(string service) => service.Contains('/');
 
-    /// <summary>The fix for a service account or a computer account that lacks AES keys.</summary>
+    private const string ComputerAction =
+        "If this is a computer account, Windows sets its msDS-SupportedEncryptionTypes itself from the computer's policy \"Network security: Configure encryption types allowed for Kerberos\", "
+        + "so a manual change is overwritten. Allow AES in that policy on the computer, and update or replace an operating system that cannot use AES. "
+        + "If its password is very old, reset the machine password (Reset-ComputerMachinePassword). "
+        + "If it is a managed service account (gMSA or sMSA), Active Directory rotates its password and it has AES keys: allow AES on it with Set-ADServiceAccount -KerberosEncryptionType AES128,AES256.";
+
+    /// <summary>
+    /// The fix for a service account without AES keys, in the order Microsoft's CVE-2026-20833 guidance implies: keys
+    /// first, then AES only. Setting AES only before the account has AES keys is exactly what makes the domain
+    /// controller block its tickets (KDCSVC 207 and 209).
+    /// </summary>
     private static (FixTarget, string, string, string) ServiceFix(string service, string problem, string extra = "")
     {
-        if (IsComputer(service)) return (FixTarget.ComputerAccount, service, problem, ComputerAction);
+        if (IsComputer(service)) return (FixTarget.ComputerAccount, service, problem, ComputerAction + extra);
+        var name = Or(service, "the account behind the service");
+        var find = IsSpn(service) ? $"Find the account behind it with setspn -Q {service}. Then reset the password of that account" : $"Reset the password of {name}";
         return (FixTarget.ServiceAccount, service, problem,
-            $"Set msDS-SupportedEncryptionTypes on the account {Or(service, "behind the service")} to AES (24) and reset its password so it gets AES keys. "
-            + $"setspn -L {Or(service, "<account>")} lists the services that run under it: test them afterwards.{extra}");
+            $"{find} so it gets AES keys, and update the password everywhere the service runs. For a keytab on a non-Windows system, export a new keytab with AES keys. "
+            + "Check that new tickets for it use AES (event 4769), then set its msDS-SupportedEncryptionTypes to AES only (0x18). "
+            + "If a device behind it cannot use AES yet, 0x24 (RC4 with AES session keys) is Microsoft's stopgap until it is replaced. "
+            + $"setspn -L {(IsSpn(service) ? "<account>" : Or(service, "<account>"))} lists the services that run under it: test them afterwards.{extra}");
     }
 
     private static (FixTarget, string, string, string) AccountFix(string account, string problem)
     {
         if (IsComputer(account)) return (FixTarget.ComputerAccount, account, problem, ComputerAction);
+        if (Classifier.IsKrbtgtName(account)) return KrbtgtFix(problem);
         return (FixTarget.Account, account, problem,
             $"Reset the password of {Or(account, "the account")} so it gets AES keys. Passwords set before the domain supported AES only have RC4 keys. "
             + "Then check that msDS-SupportedEncryptionTypes is empty or includes AES.");
     }
+
+    /// <summary>krbtgt encrypts every TGT. Its password is reset twice, because the domain keeps the previous one too.</summary>
+    private static (FixTarget, string, string, string) KrbtgtFix(string problem) =>
+        (FixTarget.DomainControllers, "krbtgt", problem,
+            "The krbtgt account has no AES keys, so every TGT of the domain is encrypted with RC4. Reset the krbtgt password twice, "
+            + "at least 10 hours apart (the maximum ticket lifetime), and let replication finish in between. Microsoft's New-KrbtgtKeys script does it safely. "
+            + "Read-only domain controllers have their own krbtgt_NNNNN accounts. Check the domain controllers' Kerberos encryption policy allows AES.");
 
     internal static (FixTarget Type, string Target, string Problem, string Action) Rule(SummaryRow r)
     {
@@ -141,8 +172,8 @@ public static class Remediation
         {
             case LegacyKind.Ntlmv1 when Any("single sign-on"):
                 return (FixTarget.Client, Or(client, account), "Single sign-on with NTLMv1-derived credentials",
-                    "Move the Wi-Fi, wired or VPN profile on this device from MS-CHAPv2 to certificate based authentication (EAP-TLS), or turn on Credential Guard. "
-                    + "Once BlockNtlmv1SSO is enforced, single sign-on with these credentials stops working.");
+                    "Move the Wi-Fi, wired or VPN profile on this device from MS-CHAPv2 (PEAP-MSCHAPv2, EAP-MSCHAPv2) to certificate based authentication (EAP-TLS or PEAP-TLS). "
+                    + "Credential Guard and an enforced BlockNtlmv1SSO both stop single sign-on with these credentials, so users have to type their password until the profile is moved.");
             case LegacyKind.Ntlmv1 when client.Length > 0:
                 return (FixTarget.Client, client, "Signs in with NTLMv1 or LM",
                     "Update the device or its software so it uses NTLMv2 or Kerberos. On Windows set \"Network security: LAN Manager authentication level\" "
@@ -158,9 +189,9 @@ public static class Remediation
                 var desFix = AccountFix(account, "Gets DES tickets");
                 return desFix with
                 {
-                    Item4 = desFix.Item1 == FixTarget.ComputerAccount ? desFix.Item4
-                        : $"Clear \"Use only Kerberos DES encryption types for this account\" on {Or(account, "the account")}, set msDS-SupportedEncryptionTypes to AES (24) "
-                          + $"and reset the password. Then update the system that asks for DES{(client.Length > 0 ? $" ({client})" : "")}.",
+                    Item4 = desFix.Item1 != FixTarget.Account ? desFix.Item4
+                        : $"Clear \"Use only Kerberos DES encryption types for this account\" on {Or(account, "the account")} and reset its password so it gets AES keys. "
+                          + $"Then set msDS-SupportedEncryptionTypes to AES (0x18) and update the system that asks for DES{(client.Length > 0 ? $" ({client})" : "")}.",
                 };
 
             case LegacyKind.Rc4 when KdcEvent(variants) is { } id:
@@ -180,6 +211,12 @@ public static class Remediation
                     _ => (FixTarget.Account, Or(account, service), "RC4 warning from the domain controller",
                         "Check the KDCSVC event text on the domain controller and the account's msDS-SupportedEncryptionTypes."),
                 };
+            case LegacyKind.Rc4 when Any("krbtgt has no AES keys"):
+                return KrbtgtFix("TGTs with RC4, krbtgt has no AES keys");
+            case LegacyKind.Rc4 when Any("Pre-auth") && Any("client offered no AES"):
+                return (FixTarget.Client, Or(client, account), "Signs in with RC4, the client offers no AES",
+                    $"The client offered only RC4 or DES for the pre-authentication of {Or(account, "the account")}. Update or reconfigure it to offer AES. "
+                    + "If the account has no AES keys either (AccountAvailableKeys in the details), reset its password too.");
             case LegacyKind.Rc4 when Any("Pre-auth"):
                 return AccountFix(account, "Signs in with an RC4 key (pre-authentication)");
             case LegacyKind.Rc4 when (service.Length == 0 || IsKrbtgt(service)) && Any("Session key") && !Any("Ticket RC4"):
@@ -205,7 +242,10 @@ public static class Remediation
             case LegacyKind.NoPreAuth:
                 return (FixTarget.Account, account, "Kerberos pre-authentication is off (AS-REP roastable)",
                     $"Clear \"Do not require Kerberos preauthentication\" on {Or(account, "the account")} (Set-ADAccountControl -DoesNotRequirePreAuth $false). "
-                    + "If an old system really needs it, give the account a long random password and AES keys.");
+                    + "If an old system really needs it, give the account a long random password and AES keys."
+                    + (Any("RC4") || Any("DES")
+                        ? " Its TGTs were also issued with RC4 or DES, which makes them even easier to crack: reset the password so it gets AES keys, and check AccountAvailableKeys in the details."
+                        : ""));
 
             case LegacyKind.LdapSigning when client.Contains("daily summary", StringComparison.OrdinalIgnoreCase) && Any("rejected"):
                 return (FixTarget.DomainControllers, Or(r.ComputersText, "Domain controllers"), "Unsigned LDAP binds are rejected, clients unknown",
@@ -231,8 +271,17 @@ public static class Remediation
             case LegacyKind.EtypeFailure when Any("client offered"):
                 return (FixTarget.Client, Or(client, account), "Kerberos fails, client offers only old ciphers",
                     "The client offers only DES or RC4 and the account or domain controller no longer accepts them. Update or reconfigure the client to support AES.");
+            case LegacyKind.EtypeFailure when Any("without AES, account has"):
+                return (FixTarget.Client, Or(client, account), "Kerberos fails, the request offers no AES",
+                    $"{Or(account, "The account")} has AES keys, but the request offered only RC4 or DES. Find the requesting client (Security event 4769 with status 0xE at the same time) "
+                    + "and update or reconfigure it to offer AES. Also check the target service's msDS-SupportedEncryptionTypes and the domain controllers' DefaultDomainSupportedEncTypes.");
             case LegacyKind.EtypeFailure when Any("service account has no AES keys"):
                 return ServiceFix(Or(service, account), "Kerberos fails, service account has no AES keys");
+            case LegacyKind.EtypeFailure when Any("check the target service"):
+                return ServiceFix(Or(service, account), "Kerberos fails, target service without a common encryption type",
+                    " Microsoft's example of this case is a target whose msDS-SupportedEncryptionTypes is 0x4 (RC4 only). The requesting user's password does not matter here.");
+            case LegacyKind.EtypeFailure when Any("account has no AES keys") && IsSpnOrService(service, account):
+                return ServiceFix(account, "Kerberos fails, service account has no AES keys");
             case LegacyKind.EtypeFailure:
                 return AccountFix(Or(account, service), "Kerberos fails, no common encryption type") is var fix && fix.Item1 == FixTarget.Account
                     ? fix with { Item4 = $"Compare the requested and available types in the events. {fix.Item4}" }
@@ -283,6 +332,10 @@ public static class Remediation
         return (type, target, problem, action);
     }
 
+    /// <summary>KDC event 16 names the service account to fix: it is the account, and the target service is its SPN.</summary>
+    internal static bool IsSpnOrService(string service, string account) => service.Length > 0 && account.Length > 0
+        && !service.Equals(account, StringComparison.OrdinalIgnoreCase) && IsSpn(service) && !Classifier.IsKrbtgtName(service);
+
     private static int? KdcEvent(IEnumerable<string> variants)
     {
         foreach (var v in variants)
@@ -292,8 +345,7 @@ public static class Remediation
         return null;
     }
 
-    private static bool IsKrbtgt(string service) =>
-        service.Equals("krbtgt", StringComparison.OrdinalIgnoreCase) || service.StartsWith("krbtgt/", StringComparison.OrdinalIgnoreCase);
+    private static bool IsKrbtgt(string service) => Classifier.IsKrbtgtName(service);
 
     private static string Or(string value, string fallback) => value.Length > 0 ? value : fallback;
 

@@ -73,7 +73,8 @@ public sealed class DiagLog : IDisposable
             if (_disposed || _full) return;
             try
             {
-                _written += line.Length + 2;
+                // Bytes, not characters: the file is UTF-8 and folder or file names can be outside ASCII.
+                _written += System.Text.Encoding.UTF8.GetByteCount(line) + 2;
                 if (_written > MaxBytes)
                 {
                     _full = true;
@@ -148,9 +149,9 @@ public sealed class DiagLog : IDisposable
                     using (new FileStream(old.FullName, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
                     old.Delete();
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    // In use.
+                    // In use or read-only: skip it, the older ones are still cleaned up.
                 }
             }
         }

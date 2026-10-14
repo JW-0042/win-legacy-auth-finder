@@ -58,7 +58,13 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
         State = p.State;
         Status = p.Message;
         Hits = p.Hits;
-        Percent = p.State == FileState.Done ? 100 : (p.Percent ?? 0) * 100;
+        // An update without a share keeps the last one, so the bar never jumps back to zero.
+        Percent = p.State switch
+        {
+            FileState.Done => 100,
+            FileState.Queued => 0,
+            _ => p.Percent is { } share ? share * 100 : _percent,
+        };
     }
 
     private void OnChanged([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
@@ -81,6 +87,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _searchCts;
     private bool _inventoryStale;
+    private bool _isCancellable;
+    // Set by "Show these events": the summary rows whose events are shown. Typing a search or picking a type clears it.
+    private (string Label, HashSet<SummaryKey> Keys)? _eventFilter;
     private string _notice = "";
     private ScanResult? _result;
     private string _folder = "";
@@ -194,6 +203,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
             : Storage.Describe(_storage);
 
     public bool IsBusy { get => _isBusy; private set { _isBusy = value; OnChanged(); OnChanged(nameof(CanAct)); OnChanged(nameof(CanScan)); } }
+
+    /// <summary>True while a scan or a folder read runs. Exports and the demo cannot be cancelled, so they show no Cancel button.</summary>
+    public bool IsCancellable { get => _isCancellable; private set { _isCancellable = value; OnChanged(); } }
     public bool CanAct => !_isBusy;
     public int RelevantCount => _inventory.Count(f => f.IsRelevant);
     public bool CanScan => !_isBusy && !_isDemo && RelevantCount > 0;
@@ -252,8 +264,27 @@ public sealed class MainViewModel : INotifyPropertyChanged
           + (_result.Duplicates > 0 ? $" {_result.Duplicates:N0} records from overlapping files were counted once." : "")
         : _result is { Duplicates: > 0 } ? $"{_result.Duplicates:N0} records from overlapping files were counted once." : "";
 
-    public string KindFilter { get => _kindFilter; set { _kindFilter = value; OnChanged(); _ = ApplyFilterAsync(); } }
-    public string Search { get => _search; set { _search = value; OnChanged(); _searchTimer.Stop(); _searchTimer.Start(); } }
+    public string KindFilter { get => _kindFilter; set { _kindFilter = value; OnChanged(); ClearEventFilter(apply: false); _ = ApplyFilterAsync(); } }
+    public string Search { get => _search; set { _search = value; OnChanged(); ClearEventFilter(apply: false); _searchTimer.Stop(); _searchTimer.Start(); } }
+
+    public bool HasEventFilter => _eventFilter is not null;
+    public string EventFilterText => _eventFilter is { } f ? $"Showing only the events of {f.Label}." : "";
+
+    public void ClearEventFilter(bool apply = true)
+    {
+        if (_eventFilter is null) return;
+        _eventFilter = null;
+        OnChanged(nameof(HasEventFilter));
+        OnChanged(nameof(EventFilterText));
+        if (apply) _ = ApplyFilterAsync();
+    }
+
+    private void SetEventFilter(string label, IEnumerable<SummaryRow> rows)
+    {
+        _eventFilter = (label, new HashSet<SummaryKey>(rows.Select(r => r.Key), SummaryKey.Comparer));
+        OnChanged(nameof(HasEventFilter));
+        OnChanged(nameof(EventFilterText));
+    }
 
     public IReadOnlyList<AuthEvent> Events { get => _events; private set { _events = value; OnChanged(); OnChanged(nameof(EventsHeader)); } }
     public IReadOnlyList<SummaryRow> Summary { get => _summary; private set { _summary = value; OnChanged(); OnChanged(nameof(SummaryHeader)); } }
@@ -303,7 +334,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             .Concat(Rows(("File", e.File), ("Record ID", e.RecordId > 0 ? e.RecordId.ToString() : "")))
             .ToList(),
         SummaryRow s => Rows(
-            ("Account", s.Account), ("Client", s.Client), ("Service", s.Service), ("Events", s.Count.ToString("N0")),
+            ("Account", s.Account), ("Domain", s.DomainsText), ("Client", s.Client), ("Service", s.Service), ("Events", s.Count.ToString("N0")),
             ("First seen", s.FirstSeen.ToString("yyyy-MM-dd HH:mm")), ("Last seen", s.LastSeen.ToString("yyyy-MM-dd HH:mm")),
             ("Logged on", s.ComputersText), ("Details", s.VariantsText)).ToList(),
         FixItem f => Rows(
@@ -344,6 +375,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
         IsBusy = true;
+        IsCancellable = true;
+        ClearEventFilter(apply: false);
         Result = null;
         Selection = null;
         Events = [];
@@ -384,6 +417,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         finally
         {
             IsBusy = false;
+            IsCancellable = false;
             StatusText = "";
             OnChanged(nameof(FilesHeader));
             OnChanged(nameof(RelevantCount));
@@ -397,13 +431,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         if (!CanScan) return;
         _searchCts?.Cancel();
-        if (_inventoryStale) await OpenFolderAsync(_folder, keepThreads: true);
+        // Scan again reads the folder again: files may have been added, replaced or deleted since the last scan, and
+        // their record ranges decide which files share records.
+        if (_inventoryStale || _result is not null) await OpenFolderAsync(_folder, keepThreads: true);
         if (!CanScan) return;
         Notice = "";
         var folder = Folder;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
         IsBusy = true;
+        IsCancellable = true;
         Result = null;
         Selection = null;
         Events = [];
@@ -411,10 +448,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         Fixes = [];
         SelectedTab = 3;
 
-        // Fresh rows, so a second scan starts from a clean state.
+        // Fresh rows, so a second scan starts from a clean state. Paths compare exactly: a case-sensitive folder can
+        // hold two files whose names differ only in case.
         Files.Clear();
-        var rows = _inventory.ToDictionary(f => f.Path, f => new FileRow(f, folder), StringComparer.OrdinalIgnoreCase);
-        foreach (var row in rows.Values) Files.Add(row);
+        var rows = new Dictionary<string, FileRow>(StringComparer.Ordinal);
+        foreach (var f in _inventory)
+        {
+            var row = new FileRow(f, folder);
+            rows[f.Path] = row;
+            Files.Add(row);
+        }
         var relevant = _inventory.Where(f => f.IsRelevant).ToList();
         var totalBytes = Math.Max(1, relevant.Sum(f => f.Size));
         var started = DateTime.Now;
@@ -465,7 +508,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
             {
                 var result = await Task.Run(() => Scanner.Scan(reader, inventory, folder, options, progress, token));
                 _log?.Write("UI", $"Scan returned: {result.TotalHits:N0} events, {result.Fixes.Count:N0} things to fix, cancelled {result.Cancelled}");
-                Show(result);
+                IsCancellable = false;
+                StatusText = "Preparing the results…";
+                await ShowAsync(result);
             }
             catch (Exception ex)
             {
@@ -482,6 +527,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _clock.Stop();
             _onTick = null;
             IsBusy = false;
+            IsCancellable = false;
             StatusText = "";
         }
     }
@@ -556,7 +602,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 Files.Add(row);
             }
             OnChanged(nameof(FilesHeader));
-            Show(result);
+            await ShowAsync(result);
         }
         finally
         {
@@ -564,38 +610,48 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private void Show(ScanResult result)
+    /// <summary>
+    /// Shows a result. An active search or type filter is applied before the busy state ends, so an export right after
+    /// the scan never gets the unfiltered lists.
+    /// </summary>
+    private async Task ShowAsync(ScanResult result)
     {
+        ClearEventFilter(apply: false);
         Result = result;
         Events = result.Events;
         Summary = result.Summary;
         Fixes = result.Fixes;
         SelectedTab = 0;
         Selection = result.Fixes.FirstOrDefault();
-        if (_search.Length > 0 || _kindFilter != "All") _ = ApplyFilterAsync();
+        if (_search.Length > 0 || _kindFilter != "All") await ApplyFilterAsync();
     }
 
-    /// <summary>Shows the events behind a summary row by searching for its account and client.</summary>
+    /// <summary>Shows exactly the events behind a summary row: same type, account, client and service.</summary>
     public void ShowEventsFor(SummaryRow row)
     {
-        _kindFilter = row.KindLabel;
+        ShowRows($"one row ({row.KindLabel}, {Describe(row)})", [row]);
+    }
+
+    /// <summary>Shows exactly the events behind a fix item: the events of the summary rows it was built from.</summary>
+    public void ShowEventsFor(FixItem item)
+    {
+        ShowRows($"fix {item.Rank} ({item.KindLabel}, {item.Target})", item.SourceRows);
+    }
+
+    private void ShowRows(string label, IReadOnlyList<SummaryRow> rows)
+    {
+        _kindFilter = "All";
         OnChanged(nameof(KindFilter));
-        _search = string.Join(' ', new[] { row.Account, row.Client, row.Service }.Where(x => x.Length > 0 && !x.Contains(' ')));
+        _search = "";
         OnChanged(nameof(Search));
+        _searchTimer.Stop();
+        SetEventFilter(label, rows);
         SelectedTab = 2;
         _ = ApplyFilterAsync();
     }
 
-    /// <summary>Shows the events behind a fix item by searching for its target.</summary>
-    public void ShowEventsFor(FixItem item)
-    {
-        _kindFilter = item.KindLabel;
-        OnChanged(nameof(KindFilter));
-        _search = item.Target.Contains(' ') || item.Target.StartsWith('(') ? "" : item.Target;
-        OnChanged(nameof(Search));
-        SelectedTab = 2;
-        _ = ApplyFilterAsync();
-    }
+    private static string Describe(SummaryRow r) =>
+        string.Join(", ", new[] { r.Account, r.Client, r.Service }.Where(x => x.Length > 0).DefaultIfEmpty("no names logged"));
 
     private async Task ApplyFilterAsync()
     {
@@ -604,15 +660,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var cts = _searchCts = new CancellationTokenSource();
         var terms = _search.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         LegacyKind? kind = Guidance.Order.Where(k => Guidance.Label(k) == _kindFilter).Select(k => (LegacyKind?)k).FirstOrDefault();
+        var keys = _eventFilter?.Keys;
         var source = _result;
         try
         {
             var (events, summary, fixes) = await Task.Run(() =>
             {
                 var ev = source.Events.AsParallel().AsOrdered().WithCancellation(cts.Token)
-                    .Where(e => (kind is null || e.Kind == kind) && (terms.Length == 0 || e.Matches(terms))).ToList();
-                var sm = source.Summary.Where(s => (kind is null || s.Kind == kind) && (terms.Length == 0 || s.Matches(terms))).ToList();
-                var fx = source.Fixes.Where(f => (kind is null || f.Kind == kind) && (terms.Length == 0 || f.Matches(terms))).ToList();
+                    .Where(e => (kind is null || e.Kind == kind) && (terms.Length == 0 || e.Matches(terms)) && (keys is null || keys.Contains(SummaryKey.Of(e))))
+                    .ToList();
+                var sm = source.Summary.Where(s => (kind is null || s.Kind == kind) && (terms.Length == 0 || s.Matches(terms)) && (keys is null || keys.Contains(s.Key))).ToList();
+                var fx = source.Fixes.Where(f => (kind is null || f.Kind == kind) && (terms.Length == 0 || f.Matches(terms))
+                    && (keys is null || f.SourceRows.Any(r => keys.Contains(r.Key)))).ToList();
                 return (ev, sm, fx);
             }, cts.Token);
             // A newer search or a new scan replaced this result in the meantime.

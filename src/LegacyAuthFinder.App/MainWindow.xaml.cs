@@ -99,15 +99,21 @@ public partial class MainWindow : Window
     // CSV uses the list separator of the user's Windows region (';' in Slovak, Czech or German), so Excel splits columns.
     private static char Separator => App.ListSeparator;
 
+    private void ClearEventFilter_Click(object sender, RoutedEventArgs e) => Vm.ClearEventFilter();
+
+    /// <summary>The rows of a list in the order the grid shows them, after the user sorted a column.</summary>
+    private static List<T> Shown<T>(DataGrid grid, IEnumerable<T> fallback) =>
+        grid.ItemsSource is null ? [.. fallback] : [.. System.Windows.Data.CollectionViewSource.GetDefaultView(grid.ItemsSource).Cast<T>()];
+
     private async void ExportFixes_Click(object sender, RoutedEventArgs e)
     {
-        var items = Vm.Fixes;
+        var items = Shown(FixGrid, Vm.Fixes);
         await Save("CSV file|*.csv", "legacy-auth-fix-list.csv", path => WriteCsv(path, w => Reports.WriteFixesCsv(w, items, Separator)));
     }
 
     private async void ExportSummary_Click(object sender, RoutedEventArgs e)
     {
-        var rows = Vm.Summary;
+        var rows = Shown(SummaryGrid, Vm.Summary);
         await Save("CSV file|*.csv", "legacy-auth-summary.csv", path => WriteCsv(path, w => Reports.WriteSummaryCsv(w, rows, Separator)));
     }
 

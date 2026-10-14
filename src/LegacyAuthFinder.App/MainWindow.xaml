@@ -84,7 +84,8 @@
                 <StackPanel Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}" Margin="0,0,0,12">
                     <ProgressBar Value="{Binding OverallProgress, Mode=OneWay}" Maximum="100" Height="6" Margin="0,0,0,6" />
                     <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" FontSize="12" Opacity="0.8" Margin="0,0,0,6" />
-                    <Button Content="_Cancel" Click="Cancel_Click" HorizontalAlignment="Left" Padding="14,4" />
+                    <Button Content="_Cancel" Click="Cancel_Click" HorizontalAlignment="Left" Padding="14,4"
+                            Visibility="{Binding IsCancellable, Converter={StaticResource BoolToVis}}" />
                 </StackPanel>
 
                 <Border CornerRadius="10" Padding="14" Margin="0,0,0,12"
@@ -118,7 +119,7 @@
 
                 <StackPanel Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
                     <TextBlock Text="Export" FontWeight="SemiBold" Margin="0,0,0,6" />
-                    <TextBlock Text="CSV files contain what the current search and type filter show. HTML and JSON always contain everything." FontSize="12" Opacity="0.6" TextWrapping="Wrap" Margin="0,0,0,6" />
+                    <TextBlock Text="CSV files contain what the lists show now: search, type filter and sort order. HTML and JSON contain the whole fix list, summary, totals and files, but not the single events. The HTML report shows up to 1,000 rows per list." FontSize="12" Opacity="0.6" TextWrapping="Wrap" Margin="0,0,0,6" />
                     <Button Content="Fix list as CSV (shown)" Click="ExportFixes_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="Summary as CSV (shown)" Click="ExportSummary_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="Events as CSV (shown)" Click="ExportEvents_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
@@ -152,6 +153,11 @@
                          ToolTip="Search accounts, clients, services, servers and files. Several words must all match." />
                 <ComboBox Grid.Column="1" ItemsSource="{Binding KindFilters}" SelectedItem="{Binding KindFilter}" ToolTip="Type" AutomationProperties.Name="Type filter" />
             </Grid>
+
+            <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10" Visibility="{Binding HasEventFilter, Converter={StaticResource BoolToVis}}">
+                <Button DockPanel.Dock="Right" Content="Show _all" Click="ClearEventFilter_Click" Padding="12,3" Margin="8,0,0,0" />
+                <TextBlock Text="{Binding EventFilterText}" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12" />
+            </DockPanel>
 
             <TabControl SelectedIndex="{Binding SelectedTab}">
                 <TabItem Header="{Binding FixesHeader}">

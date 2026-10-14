@@ -71,7 +71,7 @@ public class RemediationTests
     [Fact]
     public void Ldap_daily_summary_asks_for_the_diagnostic_setting()
     {
-        var f = Find(f => f.TargetType == FixTarget.DomainControllers);
+        var f = Find(f => f.Kind == LegacyKind.LdapSigning && f.TargetType == FixTarget.DomainControllers);
         Assert.Contains("16 LDAP Interface Events", f.Action);
         var simple = Find(f => f.Kind == LegacyKind.LdapSigning && f.Target == "10.0.20.15");
         Assert.Equal("Simple LDAP bind with a cleartext password", simple.Problem);

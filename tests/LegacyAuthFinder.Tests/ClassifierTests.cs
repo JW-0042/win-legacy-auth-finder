@@ -138,11 +138,13 @@ public class ClassifierTests
     [Fact]
     public void Kdc_etype_error_names_service_account_and_etypes()
     {
-        var e = Classify(Positional(16, Providers.Kdc, "host/aix01.lab.local", "unix-svc", "1", "18 17 23", "3 1"));
+        // %6 of event 16 is the account to reset, %2 the requester (Microsoft's message text, NetApp KB example).
+        var e = Classify(Positional(16, Providers.Kdc, "host/aix01.lab.local", "bob@LAB.LOCAL", "1", "18 17 23", "3 1", "unix-svc"));
         Assert.Equal(LegacyKind.EtypeFailure, e!.Kind);
         Assert.Equal("host/aix01.lab.local", e.Service);
         Assert.Equal("unix-svc", e.Account);
-        Assert.Equal("Requested AES256-SHA1, AES128-SHA1, RC4-HMAC, account has DES-CBC-MD5, DES-CBC-CRC", e.Variant);
+        Assert.Equal("bob@LAB.LOCAL", e.Client);
+        Assert.Equal("Requested AES256-SHA1, AES128-SHA1, RC4-HMAC, account has no AES keys (DES-CBC-MD5, DES-CBC-CRC)", e.Variant);
         Assert.Contains(e.Fields, f => f.Key == "Available etypes" && f.Value == "DES-CBC-MD5, DES-CBC-CRC");
     }
 

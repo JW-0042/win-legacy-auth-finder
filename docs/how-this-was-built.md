@@ -92,6 +92,18 @@ With the scan finally fast, I asked the agent for a full code audit of the tool 
 - **Honest results.** Overlapping exports no longer count the same event twice, a file that fails half way is shown as an error instead of a silent gap, and the event list keeps the newest events instead of the oldest.
 - **The details.** Exports no longer freeze the window, CSV files use the regional separator so Excel opens them, the version is shown in the app, the command line has exit codes for incomplete scans and failed exports, and the GitHub Actions are pinned to exact commits.
 
+## Version 0.4.2: a second audit, by three model families
+
+After 0.4.1 I asked for the same audit again, this time split up. Four Claude agents each took one part of the code (the parser, the scanner, the security advice, the app and command line), and two other AI models reviewed the changes of 0.4.1 on their own: OpenAI's Codex and xAI's Grok. Every finding was checked against the code or Microsoft's documentation before anything changed.
+
+The overlap was the interesting part. The most serious bug was found independently by Codex and by the scanner agent: duplicates were matched by record ID only, and record IDs start again at 1 after a log is cleared. An old archive next to a new log lost real findings without any warning. A test with two files expected six events and got three. The memory limit was the second double hit: every file kept its own list, so eight files at once could hold sixteen times the limit.
+
+Grok found what the others missed: a file cut off inside a chunk counted as fully read, and an account without pre-authentication and with RC4 tickets lost the RC4 advice. It also had one point I did not take: it wanted findings to win over a failed export in the exit code, but a report file that could not be written has to fail loudly.
+
+The agent that checked the advice against Microsoft's documentation found the worst problems for users. KDC event 16 names the account to reset in a field the tool ignored, so it told admins to reset the password of the user who asked for the ticket. A failed service ticket did the same. The advice for Wi-Fi and VPN profiles suggested turning on Credential Guard, which breaks exactly those profiles. None of the earlier tests could catch this, because the tests were written from the same wrong assumptions.
+
+One parser question needed an experiment instead of a guess. A crafted file showed that Windows does not always split string arrays into separate values, although real logs said it does. Dumping real classic events showed why: their values sit in a nested template, and only there does Windows split them.
+
 ## Quality gates
 
 - The build treats warnings as errors.

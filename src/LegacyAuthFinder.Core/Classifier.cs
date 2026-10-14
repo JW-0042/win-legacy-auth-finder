@@ -36,7 +36,7 @@ public static class Classifier
         >= 201 and <= 209 when Providers.IsKdc(e.Provider) => KdcWarning(e, file, pool),
         14 or 16 or 26 or 27 when Providers.IsKdc(e.Provider) => KdcEtypeError(e, file, pool),
         2887 or 2888 or 2889 or 3039 or 3040 or 3074 or 3075 when e.Provider is "" || Providers.IsDirectoryService(e.Provider) => Ldap(e, file, pool),
-        (>= 8001 and <= 8004) or (>= 4001 and <= 4003) or 4013 or (>= 4020 and <= 4027) or (>= 4030 and <= 4033)
+        (>= 8001 and <= 8004) or (>= 4001 and <= 4006) or 4013 or (>= 4020 and <= 4027) or (>= 4030 and <= 4033)
             when e.Provider is "" || Providers.IsNtlm(e.Provider) => NtlmUse(e, file, pool),
         3000 when e.Provider is "" || e.Provider.Equals(Providers.SmbServer, StringComparison.OrdinalIgnoreCase) => Smb1(e, file, pool),
         _ => null,
@@ -107,6 +107,7 @@ public static class Classifier
     /// 4030 to 4033 (domain controller): AccountName, AccountDomain, AccountMachine, ServerName, NtlmVersion.
     /// 4024/4025 (NTLMv1-derived single sign-on) and 8001: TargetName, UserName, DomainName, ProcessName.
     /// 8002: ClientUserName, ClientDomainName. 8003: UserName, DomainName, Workstation. 8004: SChannelName, UserName, DomainName, WorkstationName.
+    /// 4004 to 4006 (Netlogon, NTLM to a domain controller blocked) have the same fields as 8004.
     /// The odd numbers 4021, 4023, 4031 and 4033 are warnings, logged for a security downgrade such as NTLMv1.
     /// </summary>
     private static AuthEvent NtlmUse(RawEvent e, string file, StringPool pool)
@@ -142,8 +143,11 @@ public static class Classifier
             4003 => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["Workstation"]), "", "Incoming NTLM with a domain account blocked (4003)"),
             4001 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
                 "Outgoing NTLM blocked (4001)"),
+            // 4013 (NTLMv1BlockedByCredGuard): Credential Guard stopped single sign-on with NTLMv1, usually a Wi-Fi or VPN profile.
             4013 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
-                "NTLMv1 attempt failed (4013)"),
+                "NTLMv1 single sign-on blocked by Credential Guard (4013)"),
+            >= 4004 and <= 4006 => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["WorkstationName"]), Clean(e["SChannelName"]),
+                $"NTLM to the domain controller blocked ({e.EventId})"),
             4026 or 4027 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), First(e, "Hostname").Length > 0 ? First(e, "Hostname") : ShortHost(e.Computer),
                 First(e, "TargetService", "TargetMachine", "TargetIP"),
                 With(e.EventId == 4026 ? $"Outgoing {Ver("NTLM")}, would be blocked (audit)" : $"Outgoing {Ver("NTLM")}, blocked by policy")),
@@ -173,8 +177,9 @@ public static class Classifier
         ParseEtype(e["Status"]) == EtypeNotSupported || ParseEtype(e["FailureCode"]) == EtypeNotSupported;
 
     /// <summary>
-    /// Status 0xE. Domain controllers updated since January 2025 always log the client's offered types, so the side
-    /// to blame is the one without AES: the client's offer, the service account's keys (4769) or the account's keys.
+    /// Status 0xE. The side to blame is the one without AES: the client's offer, the service account's keys (4769) or
+    /// the account's keys (4768, 4771). A failed 4769 often has every key field empty ("-", see Microsoft's RC4 guide).
+    /// A service ticket does not depend on the requesting user's keys, so then the target service is the likely cause.
     /// </summary>
     private static AuthEvent SecurityEtypeFailure(RawEvent e, string file, StringPool pool)
     {
@@ -183,6 +188,7 @@ public static class Classifier
         var accountKeys = Clean(e["AccountAvailableKeys"]);
         var variant = offered.Length > 0 && !HasAes(offered) ? $"No common encryption type, client offered {offered}"
             : e.EventId == 4769 && serviceKeys.Length > 0 && !HasAes(serviceKeys) ? $"No common encryption type, service account has no AES keys ({serviceKeys})"
+            : e.EventId == 4769 ? "No common encryption type, check the target service's encryption types (0xE)"
             : accountKeys.Length > 0 && !HasAes(accountKeys) ? $"No common encryption type, account has no AES keys ({accountKeys})"
             : "No common encryption type (0xE)";
         var (account, domain) = SplitRealm(Clean(e["TargetUserName"]), Clean(e["TargetDomainName"]));
@@ -205,34 +211,47 @@ public static class Classifier
             account, domain, CleanIp(e["IpAddress"]), Clean(e["ServiceName"]), ticket is { } tt ? EtypeName(tt) : "", "");
     }
 
-    /// <summary>4776: the domain controller validated NTLM credentials. Logged for every NTLM sign-in that reaches the DC.</summary>
-    private static AuthEvent NtlmValidation(RawEvent e, string file, StringPool pool)
+    /// <summary>
+    /// 4776: the domain controller validated NTLM credentials. Logged for every NTLM sign-in that reaches the DC. Member
+    /// servers and workstations log it too, for local accounts, also for a sign-in or unlock at the console. Those name
+    /// the computer itself as the workstation and are not network NTLM, so they are left out.
+    /// </summary>
+    private static AuthEvent? NtlmValidation(RawEvent e, string file, StringPool pool)
     {
+        var workstation = Clean(e["Workstation"]);
+        if (workstation.Length > 0 && workstation.Equals(ShortHost(e.Computer), StringComparison.OrdinalIgnoreCase)) return null;
         var status = ParseEtype(e["Status"]);
         return Build(e, file, pool, LegacyKind.Ntlm,
             status is null or 0 ? "NTLM validated by the domain controller (4776)" : $"NTLM validation failed (4776, 0x{status:x})",
-            Clean(e["TargetUserName"]), "", Clean(e["Workstation"]), "", "", "");
+            Clean(e["TargetUserName"]), "", workstation, "", "", "");
     }
 
     /// <summary>
-    /// KDC events 14, 16, 26 and 27. Microsoft documents the insertion strings as: %1 target service,
-    /// %2 account, %3 missing key ID, %4 requested etypes, %5 the account's available etypes.
+    /// KDC events 14, 16, 26 and 27. Microsoft documents the insertion strings as: %1 target service, %2 account,
+    /// %3 missing key ID, %4 requested etypes, %5 the account's available etypes, and for 16 also %6, the account whose
+    /// password reset "will generate a proper key". In 16, %2 is often the requesting user while %6 is the service
+    /// account to fix, so %6 wins and %2 is kept as the requester.
     /// </summary>
     private static AuthEvent KdcEtypeError(RawEvent e, string file, StringPool pool)
     {
         var requested = EtypeList(e.At(3));
         var available = EtypeList(e.At(4));
-        var variant = requested.Length > 0 || available.Length > 0
-            ? $"Requested {Or(requested, "?")}, account has {Or(available, "no usable key")}"
+        var named = Clean(e.At(1));
+        var toFix = e.EventId == 16 ? Clean(e.At(5)) : "";
+        // The account has AES keys but the request offered none: the requesting side or its policy is the problem.
+        var variant = requested.Length > 0 && !HasAes(requested) && HasAes(available) ? $"Requested {requested} without AES, account has {available}"
+            : available.Length > 0 && !HasAes(available) ? $"Requested {Or(requested, "?")}, account has no AES keys ({available})"
+            : requested.Length > 0 || available.Length > 0 ? $"Requested {Or(requested, "?")}, account has {Or(available, "no usable key")}"
             : $"KDC event {e.EventId}";
         return Build(e, file, pool, LegacyKind.EtypeFailure, variant,
-            account: Clean(e.At(1)),
+            account: toFix.Length > 0 ? toFix : named,
             domain: "",
-            client: "",
+            client: toFix.Length > 0 && !toFix.Equals(named, StringComparison.OrdinalIgnoreCase) ? named : "",
             service: Clean(e.At(0)),
             ticket: "",
             session: "",
-            extra: [("Requested etypes", requested), ("Available etypes", available), ("Missing key ID", Clean(e.At(2)))]);
+            extra: [("Requested etypes", requested), ("Available etypes", available), ("Missing key ID", Clean(e.At(2))),
+                ("Account named in the event", named), ("Account to reset (16)", toFix)]);
     }
 
     /// <summary>
@@ -343,20 +362,35 @@ public static class Classifier
         var kind = Worst(ticket, session, preAuth);
         if (kind is null) return null;
 
+        var offered = Clean(e["ClientAdvertizedEncryptionTypes"]);
+        var service = Clean(e["ServiceName"]);
         var parts = new List<string>();
-        if (ticket is { } t && KindOf(t) is not null) parts.Add($"Ticket {EtypeName(t)}");
+        if (ticket is { } t && KindOf(t) is not null)
+        {
+            parts.Add($"Ticket {EtypeName(t)}");
+            // A TGT is encrypted with the key of krbtgt. Without AES keys on krbtgt every TGT is RC4.
+            var krbtgtKeys = Clean(e["ServiceAvailableKeys"]);
+            if (IsKrbtgtName(service) && krbtgtKeys.Length > 0 && !HasAes(krbtgtKeys)) parts.Add("krbtgt has no AES keys");
+        }
         if (session is { } s && KindOf(s) is not null) parts.Add($"Session key {EtypeName(s)}");
-        if (preAuth is { } pa && KindOf(pa) is not null) parts.Add($"Pre-auth {EtypeName(pa)}");
+        if (preAuth is { } pa && KindOf(pa) is not null)
+        {
+            // The pre-authentication type is picked from what the client offers. An offer without AES points to the client.
+            parts.Add(offered.Length > 0 && !HasAes(offered) ? $"Pre-auth {EtypeName(pa)}, client offered no AES" : $"Pre-auth {EtypeName(pa)}");
+        }
 
         var (account, domain) = SplitRealm(Clean(e["TargetUserName"]), Clean(e["TargetDomainName"]));
         return Build(e, file, pool, kind.Value, string.Join(", ", parts),
             account: account,
             domain: domain,
             client: CleanIp(e["IpAddress"]),
-            service: Clean(e["ServiceName"]),
+            service: service,
             ticket: ticket is { } tt ? EtypeName(tt) : "",
             session: session is { } ss ? EtypeName(ss) : "");
     }
+
+    internal static bool IsKrbtgtName(string service) =>
+        service.Equals("krbtgt", StringComparison.OrdinalIgnoreCase) || service.StartsWith("krbtgt/", StringComparison.OrdinalIgnoreCase);
 
     private static AuthEvent KdcWarning(RawEvent e, string file, StringPool pool)
     {

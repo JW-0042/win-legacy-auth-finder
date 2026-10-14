@@ -89,7 +89,8 @@ public static class DemoData
             }
 
             // Kerberos requests that fail for lack of a common encryption type.
-            KdcEtype(random, "DC01", 16, "host/aix01.contoso.local", "unix-svc", "18 17 23", "3 1", 12);
+            // Event 16 names the requesting user in %2 and the account to reset in %6.
+            KdcEtype(random, "DC01", 16, "host/aix01.contoso.local", $"m.kovac@{Realm}", "18 17 23", "3 1", 12, toReset: "unix-svc");
             KdcEtype(random, "DC01", 27, "krbtgt", "admin-old", "18 17", "23", 6);
             for (var i = 0; i < 25; i++)
             {
@@ -227,11 +228,12 @@ s.exe" });
                     ["TicketEncryptionType"] = $"0x{ticket:x}",
                     ["SessionKeyEncryptionType"] = $"0x{session:x}",
                     ["ClientAdvertizedEncryptionTypes"] = ticket == 0x17 && session == 0x17 ? "RC4-HMAC-NT" : "AES256-CTS-HMAC-SHA1-96, AES128-CTS-HMAC-SHA1-96, RC4-HMAC-NT",
-                    ["ServiceAvailableKeys"] = ticket == 0x17 ? "RC4" : "AES-SHA1, RC4",
+                    // In 4768 the service is krbtgt, which has AES keys in any domain whose krbtgt password was reset since 2008.
+                    ["ServiceAvailableKeys"] = id == 4769 && ticket == 0x17 ? "RC4" : "AES-SHA1, RC4",
                     ["DCAvailableKeys"] = "AES-SHA1, RC4",
                     ["PreAuthType"] = id == 4768 ? preAuthType : "",
                     ["PreAuthEncryptionType"] = preAuth is { } pa ? $"0x{pa:x}" : "",
-                    ["AccountAvailableKeys"] = preAuth is not null ? "RC4" : "",
+                    ["AccountAvailableKeys"] = id == 4768 && (preAuth is not null || ticket == 0x17) ? "RC4" : "",
                 }));
             }
         }
@@ -259,12 +261,13 @@ s.exe" });
             }
         }
 
-        private void KdcEtype(Random r, string host, int id, string service, string account, string requested, string available, int count)
+        private void KdcEtype(Random r, string host, int id, string service, string account, string requested, string available, int count,
+            string? toReset = null)
         {
             for (var i = 0; i < count; i++)
             {
                 Add(PathFor(host, Channels.System), new RawEvent(id, Providers.Kdc, RandomTime(r), $"{host}.contoso.local", 0,
-                    new Dictionary<string, string>(), [service, account, "1", requested, available]));
+                    new Dictionary<string, string>(), toReset is null ? [service, account, "1", requested, available] : [service, account, "1", requested, available, toReset]));
             }
         }
 

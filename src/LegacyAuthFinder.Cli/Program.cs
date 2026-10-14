@@ -1,7 +1,7 @@
 using LegacyAuthFinder.Core;
 
 // legacy-auth-scan <folder> [--no-recurse] [--threads n] [--events-csv f] [--summary-csv f] [--fix-csv f] [--json f] [--html f]
-//                  [--csv-separator c] [--log f | --no-log] [--windows-api] [--quiet]
+//                  [--csv-separator <, ; | tab>] [--log f | --no-log] [--windows-api] [--quiet]
 // Exit codes: 0 = nothing found, 1 = legacy authentication found, 2 = invalid arguments, 3 = no readable log files,
 //             4 = nothing found but incomplete (cancelled, or files with read errors), 5 = an export could not be written.
 
@@ -9,7 +9,7 @@ Console.OutputEncoding = System.Text.Encoding.UTF8;
 System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
 
 const string Usage = "Usage: legacy-auth-scan <folder> [--no-recurse] [--threads <1-64>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] "
-    + "[--json <file>] [--html <file>] [--csv-separator <char>] [--log <file> | --no-log] [--windows-api] [--quiet]";
+    + "[--json <file>] [--html <file>] [--csv-separator <, ; | tab>] [--log <file> | --no-log] [--windows-api] [--quiet]";
 const int Incomplete = 4, ExportFailed = 5;
 
 string? folder = null, eventsCsv = null, summaryCsv = null, fixCsv = null, jsonPath = null, htmlPath = null, logPath = null;
@@ -33,10 +33,11 @@ for (var i = 0; i < args.Length; i++)
         case "--summary-csv" when i + 1 < args.Length: summaryCsv = args[++i]; break;
         case "--fix-csv" when i + 1 < args.Length: fixCsv = args[++i]; break;
         case "--csv-separator" when i + 1 < args.Length:
+            // Only separators that cannot appear unquoted in a value: dates, labels and numbers are written as they are.
             var sep = args[++i] is "tab" or "\\t" ? "\t" : args[i];
-            if (sep.Length != 1 || sep[0] is '"' or '\r' or '\n')
+            if (sep is not ("," or ";" or "|" or "\t"))
             {
-                Console.Error.WriteLine("--csv-separator must be one character, for example ; or , or tab.");
+                Console.Error.WriteLine("--csv-separator must be , or ; or | or tab.");
                 return 2;
             }
             separator = sep[0];
@@ -75,6 +76,15 @@ foreach (var path in new[] { eventsCsv, summaryCsv, fixCsv, jsonPath, htmlPath, 
 }
 
 ScanResult result;
+// Ctrl+C during the scan stops it cleanly and the partial result is reported. After the scan it ends the program as usual.
+using var cts = new CancellationTokenSource();
+var scanning = false;
+Console.CancelKeyPress += (_, e) =>
+{
+    if (!Volatile.Read(ref scanning)) return;
+    e.Cancel = true;
+    cts.Cancel();
+};
 // Only the option names go to the log, not the paths: they can contain user or server names.
 using var log = noLog || demo ? null : DiagLog.Create("CLI " + string.Join(' ', args.Where(a => a.StartsWith("--", StringComparison.Ordinal))), logPath);
 if (demo)
@@ -94,8 +104,7 @@ else
     var storage = Storage.Detect(folder);
     log?.Write("FOLDER", $"storage {storage}, {Storage.Explain(folder)}");
     threads ??= Storage.RecommendedThreads(storage);
-    using var cts = new CancellationTokenSource();
-    Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+    Volatile.Write(ref scanning, true);
 
     IReadOnlyList<LogFileInfo> files;
     try
@@ -105,6 +114,7 @@ else
     catch (OperationCanceledException)
     {
         Console.Error.WriteLine("Cancelled while reading the folder. Nothing was scanned.");
+        Volatile.Write(ref scanning, false);
         return Incomplete;
     }
     if (!quiet)
@@ -113,13 +123,14 @@ else
         Console.WriteLine($"{Storage.Describe(storage)} Scanning {threads} at once.");
         foreach (var f in files)
         {
-            Console.WriteLine($"  {f.Name,-48} {(f.Error is null ? Channels.Short(f.Channel) : "unreadable"),-12} {Reports.SizeText(f.Size),10}  {f.Computer}");
+            Console.WriteLine($"  {Safe(f.Name),-48} {(f.Error is null ? Channels.Short(f.Channel) : "unreadable"),-12} {Reports.SizeText(f.Size),10}  {Safe(f.Computer)}");
         }
         Console.WriteLine();
     }
     if (!files.Any(f => f.IsRelevant))
     {
         Console.Error.WriteLine("No readable Security, System, Directory Service, NTLM Operational or SMBServer Audit logs found.");
+        Volatile.Write(ref scanning, false);
         return 3;
     }
 
@@ -128,10 +139,11 @@ else
     {
         if (p.State is FileState.Done or FileState.Error or FileState.Cancelled)
         {
-            Console.WriteLine($"  {Path.GetFileName(p.Path),-48} {p.State,-10} {p.Message}");
+            Console.WriteLine($"  {Safe(Path.GetFileName(p.Path)),-48} {p.State,-10} {Safe(p.Message)}");
         }
     });
     result = Scanner.Scan(reader, files, Path.GetFullPath(folder), new ScanOptions(threads.Value, Log: log), progress, cts.Token);
+    Volatile.Write(ref scanning, false);
 }
 
 if (!quiet)
@@ -142,7 +154,7 @@ if (!quiet)
     if (result.Duplicates > 0) Console.WriteLine($"{result.Duplicates:N0} records from overlapping files were counted once.");
     foreach (var s in result.Summary.Take(25))
     {
-        Console.WriteLine($"  {s.KindLabel,-13} {s.Count,10:N0}  {s.Account,-32} {s.Client,-20} {s.Service}");
+        Console.WriteLine($"  {s.KindLabel,-13} {s.Count,10:N0}  {Safe(s.Account),-32} {Safe(s.Client),-20} {Safe(s.Service)}");
     }
     if (result.Summary.Count > 25) Console.WriteLine($"  … {result.Summary.Count - 25} more rows. Use --summary-csv for the full list.");
     if (result.Fixes.Count > 0)
@@ -151,7 +163,7 @@ if (!quiet)
         Console.WriteLine("What to fix first:");
         foreach (var f in result.Fixes.Take(15))
         {
-            Console.WriteLine($"  {f.Rank,3}. {f.KindLabel,-12} {f.TargetTypeText,-18} {f.Target,-32} {f.Problem}");
+            Console.WriteLine($"  {f.Rank,3}. {f.KindLabel,-12} {f.TargetTypeText,-18} {Safe(f.Target),-32} {Safe(f.Problem)}");
         }
         if (result.Fixes.Count > 15) Console.WriteLine($"  … {result.Fixes.Count - 15} more. Use --fix-csv for the full list with the steps.");
     }
@@ -200,7 +212,13 @@ if (exportFailed) return ExportFailed;
 if (result.TotalHits > 0) return 1;
 return result.Incomplete ? Incomplete : 0;
 
-// The folder must exist and accept a new file.
+// Text from the events goes to the console without control characters. A crafted account or workstation name could
+// otherwise carry terminal escape sequences that rewrite lines or the window title.
+static string Safe(string text) =>
+    text.Any(char.IsControl) ? new string(text.Select(c => char.IsControl(c) ? '?' : c).ToArray()) : text;
+
+// The folder must exist and accept a new file, and a file that is already there must be writable: not read-only and
+// not open in another program (a CSV still open in Excel is the usual case).
 static string? CheckWritable(string path)
 {
     try
@@ -209,6 +227,12 @@ static string? CheckWritable(string path)
         var dir = Path.GetDirectoryName(full);
         if (dir is null || !Directory.Exists(dir)) return "the folder does not exist";
         if (Directory.Exists(full)) return "it is a folder";
+        if (File.Exists(full))
+        {
+            // Opening for writing without truncating leaves the old content alone.
+            using (new FileStream(full, FileMode.Open, FileAccess.Write, FileShare.None)) { }
+            return null;
+        }
         var probe = Path.Combine(dir, $".legacy-auth-scan-{Environment.ProcessId}.tmp");
         File.WriteAllText(probe, "");
         File.Delete(probe);

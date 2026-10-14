@@ -34,11 +34,11 @@ public static class Reports
     public static void WriteSummaryCsv(TextWriter w, IEnumerable<SummaryRow> rows, char separator = ',')
     {
         string C(string v) => Csv(v, separator);
-        w.WriteLine(string.Join(separator, "Type", "Account", "Client", "Service", "Count", "FirstSeen", "LastSeen", "Computers", "Details"));
+        w.WriteLine(string.Join(separator, "Type", "Account", "Domains", "Client", "Service", "Count", "FirstSeen", "LastSeen", "Computers", "Details"));
         foreach (var r in rows)
         {
             w.WriteLine(string.Join(separator,
-                r.KindLabel, C(r.Account), C(r.Client), C(r.Service), r.Count.ToString(CultureInfo.InvariantCulture),
+                r.KindLabel, C(r.Account), C(r.DomainsText), C(r.Client), C(r.Service), r.Count.ToString(CultureInfo.InvariantCulture),
                 r.FirstSeen.ToString(TimeFormat, CultureInfo.InvariantCulture), r.LastSeen.ToString(TimeFormat, CultureInfo.InvariantCulture),
                 C(r.ComputersText), C(r.VariantsText)));
         }
@@ -135,6 +135,7 @@ public static class Reports
         {
             type = s.KindLabel,
             account = s.Account,
+            domains = s.Domains.Order(StringComparer.OrdinalIgnoreCase),
             client = s.Client,
             service = s.Service,
             count = s.Count,
@@ -180,7 +181,7 @@ public static class Reports
                 sb.Append($"<tr><td>{f.Rank}</td><td class=\"k {f.Kind}\">{f.KindLabel}</td><td>{E(f.TargetTypeText)}</td><td>{E(f.Target)}</td><td>{E(f.Problem)}</td><td>{E(f.Action)}</td><td>{f.Events:N0}</td><td>{f.LastSeen:yyyy-MM-dd HH:mm}</td></tr>");
             }
             sb.Append("</table>");
-            if (r.Fixes.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Fixes.Count} items. Export the fix list as CSV for the full list.</p>");
+            if (r.Fixes.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Fixes.Count} items. The fix list CSV has all of them (in the app: with no search or type filter).</p>");
         }
 
         sb.Append($"<h2>Who still uses it</h2><table><tr><th>Type</th><th>Account</th><th>Client</th><th>Service</th><th>Count</th><th>First seen</th><th>Last seen</th><th>Logged on</th></tr>");
@@ -189,7 +190,7 @@ public static class Reports
             sb.Append($"<tr><td class=\"k {s.Kind}\">{s.KindLabel}</td><td>{E(s.Account)}</td><td>{E(s.Client)}</td><td>{E(s.Service)}</td><td>{s.Count:N0}</td><td>{s.FirstSeen:yyyy-MM-dd HH:mm}</td><td>{s.LastSeen:yyyy-MM-dd HH:mm}</td><td>{E(s.ComputersText)}</td></tr>");
         }
         sb.Append("</table>");
-        if (r.Summary.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Summary.Count} rows. Export the summary as CSV for the full list.</p>");
+        if (r.Summary.Count > HtmlSummaryRows) sb.Append($"<p class=\"meta\">Showing {HtmlSummaryRows} of {r.Summary.Count} rows. The summary CSV has all of them (in the app: with no search or type filter).</p>");
 
         sb.Append("<h2>Files</h2><table><tr><th>File</th><th>Log</th><th>Computer</th><th>Size</th><th>From</th><th>To</th><th>Result</th></tr>");
         foreach (var f in r.Files)

@@ -19,8 +19,9 @@ public partial class App : Application
     // It never touches real logs, so no real machine names, accounts or scripts can end up in public images.
     protected override async void OnStartup(StartupEventArgs e)
     {
+        // Only separators that cannot appear unquoted in a value, like the command line allows.
         var regional = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ListSeparator;
-        if (regional.Length == 1) ListSeparator = regional[0];
+        if (regional is "," or ";" or "|" or "\t") ListSeparator = regional[0];
         // The interface is in English, so numbers and dates follow English formatting everywhere.
         System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
         System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
@@ -32,12 +33,33 @@ public partial class App : Application
             // One diagnostic log per session. Unhandled errors end up there too.
             var log = Core.DiagLog.Create("GUI");
             _log = log;
+            var errors = new Queue<DateTime>();
+            var showing = false;
             DispatcherUnhandledException += (_, ex) =>
             {
-                // Logged and shown, the app keeps running with its results.
+                // Logged and shown, the app keeps running with its results. An error that comes back at once (in layout
+                // or rendering) would open one dialog after another, so the third within 10 seconds closes the app.
                 log.Error("CRASH", "UI thread", ex.Exception);
                 ex.Handled = true;
-                MessageBox.Show(MainWindow, ex.Exception.Message, "Legacy Auth Finder", MessageBoxButton.OK, MessageBoxImage.Error);
+                var now = DateTime.UtcNow;
+                errors.Enqueue(now);
+                while (errors.Count > 0 && now - errors.Peek() > TimeSpan.FromSeconds(10)) errors.Dequeue();
+                if (errors.Count >= 3)
+                {
+                    log.Write("CRASH", "The same kind of error keeps coming back, closing the app");
+                    Shutdown(1);
+                    return;
+                }
+                if (showing) return;
+                showing = true;
+                try
+                {
+                    MessageBox.Show(MainWindow, ex.Exception.Message, "Legacy Auth Finder", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+                finally
+                {
+                    showing = false;
+                }
             };
             AppDomain.CurrentDomain.UnhandledException += (_, ex) => { if (ex.ExceptionObject is Exception x) log.Error("CRASH", "unhandled", x); };
             TaskScheduler.UnobservedTaskException += (_, ex) => log.Error("CRASH", "unobserved task", ex.Exception);

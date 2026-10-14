@@ -120,7 +120,9 @@ public class AuditFixTests
         var service = Fail(("ClientAdvertizedEncryptionTypes", "AES256-CTS-HMAC-SHA1-96"), ("ServiceAvailableKeys", "RC4"));
         Assert.Contains("service account has no AES keys", service.Variant);
         Assert.Equal(("bob", "LAB.LOCAL"), (service.Account, service.Domain));
-        Assert.Equal("No common encryption type (0xE)", Fail(("ClientAdvertizedEncryptionTypes", "AES256-CTS-HMAC-SHA1-96"), ("ServiceAvailableKeys", "AES-SHA1, RC4")).Variant);
+        // A service ticket does not depend on the requester's keys: without other evidence the target service is the cause.
+        Assert.Contains("check the target service", Fail(("ClientAdvertizedEncryptionTypes", "AES256-CTS-HMAC-SHA1-96"), ("ServiceAvailableKeys", "AES-SHA1, RC4")).Variant);
+        Assert.Contains("check the target service", Fail().Variant);
     }
 
     [Fact]
