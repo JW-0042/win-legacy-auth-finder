@@ -11,8 +11,9 @@ public class RemediationTests
     [Fact]
     public void Rc4_service_tickets_point_to_the_service_account()
     {
-        var f = Find(f => f.Kind == LegacyKind.Rc4 && f.Target == "HTTP/erp.contoso.local" && f.TargetType == FixTarget.ServiceAccount && f.Problem == "Service tickets with RC4");
-        Assert.Contains("setspn -Q HTTP/erp.contoso.local", f.Action);
+        // 4769 logs the account that runs the service (ServiceName), not an SPN.
+        var f = Find(f => f.Kind == LegacyKind.Rc4 && f.Target == "svc-erp" && f.TargetType == FixTarget.ServiceAccount && f.Problem == "Service tickets with RC4");
+        Assert.Contains("setspn -L svc-erp", f.Action);
         Assert.Contains("msDS-SupportedEncryptionTypes", f.Action);
     }
 
@@ -36,7 +37,7 @@ public class RemediationTests
     public void Ntlmv1_from_the_security_log_and_the_ntlm_log_merge_per_client()
     {
         // LEGACY-XP01 shows up in 4624, 4625 and in the enhanced event 4023 with NTLM version 1.
-        var f = Find(f => f.Kind == LegacyKind.Ntlmv1 && f.Target == "10.0.30.7");
+        var f = Find(f => f.Kind == LegacyKind.Ntlmv1 && f.Target == "LEGACY-XP01");
         Assert.Equal(FixTarget.Client, f.TargetType);
         Assert.True(f.Rows >= 2);
         Assert.Equal(212 + 18 + 25, f.Events);
@@ -79,9 +80,12 @@ public class RemediationTests
     [Fact]
     public void Kdc_warnings_follow_the_event_meaning()
     {
-        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Offers only RC4");
-        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Service without AES keys");
-        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Account without AES keys");
+        // Microsoft's CVE-2026-20833 KB: 201 and 206 are the client's fault, 202 and 207 the service account's, 205 the KDC default.
+        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Offers only RC4" && f.TargetType == FixTarget.Client);
+        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Offers only RC4 to an AES-only service" && f.TargetType == FixTarget.Client);
+        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "Service account without AES keys" && f.Target == "svc-erp");
+        Assert.Contains(Demo.Fixes, f => f.Kind == LegacyKind.Rc4 && f.Problem == "AES-only service account without AES keys" && f.Target == "svc-legacy");
+        Assert.Contains(Demo.Fixes, f => f.TargetType == FixTarget.DomainPolicy && f.Action.Contains("DefaultDomainSupportedEncTypes"));
     }
 
     [Fact]

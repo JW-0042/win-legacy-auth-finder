@@ -4,7 +4,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)
 
-Legacy Auth Finder finds **NTLMv1, RC4, DES, SMBv1, unsigned LDAP and any NTLM use** in archived Windows event logs, plus the Kerberos requests that already fail for lack of a common encryption type. Point it at a folder of `.evtx` files copied from your servers and domain controllers. It works out which log each file is, then scans the Security, System, Directory Service, NTLM Operational and SMBServer Audit logs when you press Start scan. It turns the findings into a ranked fix list: which client, account or service account to change, and how. You can search everything and export it. Files of 4 GB and more are fine.
+Legacy Auth Finder finds **NTLMv1, RC4, DES, SMBv1, unsigned LDAP and any NTLM use** in archived Windows event logs, plus the Kerberos requests that already fail for lack of a common encryption type and accounts that do not need Kerberos pre-authentication. Point it at a folder of `.evtx` files copied from your servers and domain controllers. It works out which log each file is, then scans the Security, System, Directory Service, NTLM Operational and SMBServer Audit logs when you press Start scan. It turns the findings into a ranked fix list: which client, account or service account to change, and how. You can search everything and export it. Files of 4 GB and more are fine.
 
 ![Legacy Auth Finder, ranked list of what to fix](docs/screenshot-fix-light.png)
 
@@ -36,14 +36,16 @@ Legacy Auth Finder does all of that in one pass and gives you that list.
 
 | Type | Where | How it is recognized |
 |---|---|---|
-| NTLMv1 and LM | Security log, events 4624 and 4625 (any server) | `LmPackageName` is `NTLM V1` or `LM` |
-| RC4 | Security log, events 4768, 4769, 4770 (domain controllers) | `TicketEncryptionType` or `SessionKeyEncryptionType` is `0x17` or `0x18` |
+| NTLMv1 and LM | Security log, events 4624 and 4625 (any server) | `LmPackageName` is `NTLM V1` or `LM`. Anonymous sessions (ANONYMOUS LOGON) are ignored, as Microsoft recommends. |
+| RC4 | Security log, events 4768, 4769, 4770 (domain controllers) | `TicketEncryptionType`, `SessionKeyEncryptionType` or `PreAuthEncryptionType` is `0x17` or `0x18` |
 | DES | Security log, events 4768, 4769, 4770 (domain controllers) | `TicketEncryptionType` or `SessionKeyEncryptionType` is `0x1` or `0x3` |
-| RC4 warnings | System log, KDCSVC events 201 to 209 (domain controllers) | Added by Microsoft in 2026 for the RC4 phase-out |
-| Unsigned LDAP | Directory Service log, events 2889 and 2887 (domain controllers) | 2889 names the client, the account and the bind type: SASL without signing or a simple bind with a cleartext password. 2887 is the daily count. |
-| LDAP channel binding | Directory Service log, events 3039, 3074, 3075 | Clients that connect over LDAPS without a valid channel binding token |
+| RC4 warnings | System log, KDCSVC events 201 to 209 (domain controllers) | Added by Microsoft in 2026 for the RC4 phase-out. 201, 203, 206 and 208 point to the client, 202, 204, 207 and 209 to the service account, 205 to the domain setting `DefaultDomainSupportedEncTypes`. |
+| No pre-authentication | Security log, event 4768 (domain controllers) | `PreAuthType` is `0`: the account has "Do not require Kerberos preauthentication" set and can be attacked offline (AS-REP roasting) |
+| Unsigned LDAP | Directory Service log, events 2889, 2887 and 2888 (domain controllers) | 2889 names the client, the account and the bind type: SASL without signing or a simple bind with a cleartext password. 2887 is the daily count of accepted binds, 2888 of rejected ones. |
+| LDAP channel binding | Directory Service log, events 3039, 3040, 3074, 3075 | Clients that connect over LDAPS without a valid channel binding token. 3040 is the daily count. |
 | Encryption type errors | System log, KDC events 14, 16, 26, 27, and Security events 4768, 4769, 4771 with status `0xE` | Kerberos requests that failed because client, account and domain controller had no encryption type in common. These are what breaks when RC4 or DES is turned off. |
-| NTLM use | NTLM Operational log, events 4020 to 4023 (clients and servers), 4030 to 4033 (domain controllers), 8001 to 8004 | Any NTLM authentication, with the reason Windows logged: target given as an IP address, SPN not found, duplicate SPN, local account and so on. NTLM version 1 in these events counts as NTLMv1. |
+| NTLM use | NTLM Operational log, events 4020 to 4023 (clients and servers), 4030 to 4033 (domain controllers), 4026 and 4027 (would be or was blocked), 8001 to 8004 (audit) and 4001 to 4003 (blocked) | Any NTLM authentication, with the reason Windows logged: target given as an IP address, SPN not found, duplicate SPN, local account and so on. NTLM version 1 in these events, and the failed NTLMv1 attempt 4013, count as NTLMv1. |
+| NTLM on domain controllers | Security log, event 4776 (domain controllers) | Every NTLM credential validation, with account and workstation. Useful where the enhanced NTLM events do not exist yet. |
 | NTLMv1 single sign-on | NTLM Operational log, events 4024 and 4025 | Wi-Fi, wired or VPN profiles (MS-CHAPv2) that use NTLMv1-derived credentials. They stop working when `BlockNtlmv1SSO` is enforced. |
 | SMBv1 | SMBServer Audit log, event 3000 (file servers) | Clients that still connect with SMB version 1 |
 
@@ -51,9 +53,10 @@ Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAva
 
 **Auditing must be on.**
 - NTLMv1 shows up only when "Audit Logon" success is enabled on the server.
-- RC4, DES and the `0xE` failures show up only when "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" are enabled on the domain controllers (failure auditing for the `0xE` events).
+- RC4, DES, missing pre-authentication and the `0xE` failures show up only when "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" are enabled on the domain controllers (failure auditing for the `0xE` events). Status `0xE` in event 4769 is logged only when `KdcExtraLogLevel` includes `0x10`.
+- Event 4776 needs "Audit Credential Validation" on the domain controllers.
 - Event 2889 needs the "16 LDAP Interface Events" diagnostic value set to 2 on the domain controllers. Without it you only get the daily summary 2887, which tells you that unsigned binds happen but not who makes them.
-- Channel binding events appear only when the domain controller's channel binding policy is set to "When supported" or "Always".
+- Channel binding events appear only when the domain controller's channel binding policy is set to "When supported" or "Always". 3039, 3074 and 3075 also need "16 LDAP Interface Events" set to 2.
 - The enhanced NTLM events 4020 to 4033 exist on Windows 11 24H2 and Windows Server 2025, and on Server 2019 and 2022 with the October 2026 updates. "NTLM Enhanced Logging" and "Log Enhanced Domain-wide NTLM Logs" are on by default. Events 8001 to 8004 appear when a "Network security: Restrict NTLM" policy is set to audit.
 - SMBv1 event 3000 needs `Set-SmbServerConfiguration -AuditSmb1Access $true` on the file server.
 - The NTLM Operational and SMBServer Audit logs are small by default. Export or archive them regularly, or enlarge them, if you want weeks of history.
@@ -63,25 +66,32 @@ Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAva
 1. **Inventory.** When you open a folder, every `.evtx` file in it and its subfolders is opened and its first record tells which log it belongs to. File names like `Archive-Security-...` are not trusted. Unreadable or damaged files are listed with the reason. Nothing is scanned yet, so you can check the file list first.
 2. **Scan.** Press Start scan. The tool reads the `.evtx` files itself with a built-in parser: it streams each file once, in 4 MB blocks, and answers all questions for that log in the same pass. A record is only decoded in full when its event ID is one the tool looks for, so a 4 GB file is never loaded into memory and the disk reads it from start to end. Damaged parts of a file are skipped and counted, the rest is still read. Files that are not `.evtx` files at all go to the Windows event log API instead.
    - **Why not the Windows API?** With the Windows API, the Windows Event Log service opens and filters every file. It needs one pass per question and has to evaluate the filter for every record. On a domain controller archive of 99 GB it ran at about 12 MB per second per file for the RC4 question, so a scan took the better part of an hour. The built-in reader is limited by the disk instead. "Use the Windows API" in the app, or `--windows-api`, switches back for comparison.
-   - **Same results.** The tests compare the parser with the Windows API on real exported logs, record by record: event ID, provider, time, computer, channel and every value, formatted the same way. On the CI runner this includes the Security log.
+   - **Same results.** The tests compare the parser with the Windows API on real exported logs, record by record: event ID, provider, time, computer, channel and every value, formatted the same way, and the values as the event XML shows them. On the CI runner this includes the Security log.
+   - **Overlapping exports.** When two files cover the same records of the same log on the same computer, for example a daily and a weekly export, every event is counted once. The number of skipped duplicates is shown with the results.
 3. **Files at once.** When you open a folder, the tool checks what kind of disk it is on and picks the number of files to scan in parallel: up to 8 on an SSD, 2 on a hard disk or a network share. You can change it, but on one hard disk more files at once make the disk seek between them and the whole scan slower.
 4. **Results.**
-   - **What to fix** turns the findings into a ranked list of things to change: the client, the account, the service account, the domain controllers or the domain policy, with the concrete step. RC4 service tickets point to the service account behind the SPN, RC4 TGTs to the account without AES keys, RC4 session keys to the client, NTLM to the reason Windows logged. The most urgent types come first.
+   - **What to fix** turns the findings into a ranked list of things to change: the client, the account, the service account, a computer account, a server, the domain controllers or the domain policy, with the concrete step. RC4 service tickets point to the service account (`setspn -L <account>` lists its SPNs), RC4 TGTs to the account without AES keys, RC4 session keys to the client, `0xE` failures to the side without AES keys, NTLM to the reason Windows logged. The most urgent types come first.
    - **Who uses it** groups the events by type, account, client and service, with counts and first and last seen.
    - **Events** lists every single event and is searchable.
    - **Files** shows the detected log, the computer, the time range and the result of each file.
 
-With the built-in reader the disk sets the pace. On an SSD several files at once keep it busy, on a hard disk or a network share 2 files at once is best because each file is read from start to end. Very large results are handled too: the event list keeps the first 2 million events, and the summary and totals always count all of them.
+With the built-in reader the disk sets the pace. On an SSD several files at once keep it busy, on a hard disk or a network share 2 files at once is best because each file is read from start to end. Very large results are handled too: the event list keeps the newest 2 million events (fewer on a machine with little memory), and the summary and totals always count all of them. A file with read errors is marked as an error and the results say they are incomplete.
 
 ## Searching
 
-Type one or more words into the search box. A row matches when every word appears in the account, client, service, server, file or type. For example, `sql01 10.0.10.21` shows the RC4 tickets of one client for one SQL server. Double-click a fix or a summary row, or use "Show these events", to jump to its events. CSV exports contain exactly what you currently see.
+Type one or more words into the search box. A row matches when every word appears in the account, client, service, server, file or type. For example, `sql01 10.0.10.21` shows the RC4 tickets of one client for one SQL server. Double-click a fix or a summary row, or use "Show these events", to jump to its events. Ctrl+F jumps to the search box.
+
+## Export
+
+The buttons marked "(shown)" export exactly what you currently see, after search. "(all)" exports everything: the HTML report and JSON. CSV files use the list separator of your Windows region, so they open correctly in Excel (`;` in most of Europe). The command line uses `,` unless you give `--csv-separator`.
 
 ## Diagnostic log
 
 Every session writes a diagnostic log to `%LOCALAPPDATA%\LegacyAuthFinder\Logs` (the newest 20 are kept). "Open log folder" in the app selects the current file. It records the disk type, every file with its size and record range, how long each file took (speed, chunks, records, damaged parts), and every 10 seconds the state of each running file: what it is doing, how much of it is read, and how busy this process and the Windows Event Log service are (CPU, disk reads, threads). A file without progress for 15 seconds is marked `STALL`. The log never contains account names, client addresses or other event content, only file names and timings. If a scan gets stuck or crawls, this file shows where.
 
 ## Download
+
+The version is shown in the window title and in the side panel.
 
 Grab `LegacyAuthFinder-win-x64.zip` from the [latest release](https://github.com/JW-0042/win-legacy-auth-finder/releases/latest). It contains two self-contained executables, so no .NET install is needed:
 
@@ -95,10 +105,10 @@ No admin rights are needed to read copied `.evtx` files. GitHub Actions builds e
 ## Command line
 
 ```
-legacy-auth-scan <folder> [--no-recurse] [--threads <n>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--log <file> | --no-log] [--windows-api] [--quiet]
+legacy-auth-scan <folder> [--no-recurse] [--threads <1-64>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--csv-separator <char>] [--log <file> | --no-log] [--windows-api] [--quiet]
 ```
 
-The command line writes the same diagnostic log as the app, to the default folder or to `--log <file>`.
+The command line writes the same diagnostic log as the app, to the default folder or to `--log <file>`. Output paths are checked before the scan starts, so a typo does not cost you a long scan. `--csv-separator` takes one character or `tab`.
 
 | Exit code | Meaning |
 |---|---|
@@ -106,6 +116,8 @@ The command line writes the same diagnostic log as the app, to the default folde
 | 1 | Legacy authentication found (any type, NTLM included) |
 | 2 | Invalid arguments |
 | 3 | No readable Security, System, Directory Service, NTLM Operational or SMBServer Audit logs in the folder |
+| 4 | Incomplete: cancelled, or some files had read errors |
+| 5 | An export file could not be written |
 
 Example:
 

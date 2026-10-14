@@ -12,8 +12,11 @@ public sealed record ScanOptions(int Threads = 2, int MaxEvents = Scanner.Defaul
 
 public static class Scanner
 {
-    /// <summary>Events kept for the event list. The summary always counts every event, also beyond this limit.</summary>
+    /// <summary>Events kept for the event list (the newest ones). The summary always counts every event, also beyond this limit.</summary>
     public const int DefaultMaxEvents = 2_000_000;
+
+    /// <summary>Rough memory of one kept event with its detail fields, used to lower the limit on small machines.</summary>
+    private const long BytesPerEvent = 800;
 
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan LongGap = TimeSpan.FromSeconds(2);
@@ -36,7 +39,15 @@ public static class Scanner
         Parallel.For(0, paths.Count, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, maxParallel), CancellationToken = cancellationToken }, i =>
         {
             var one = Stopwatch.StartNew();
-            result[i] = reader.Inspect(paths[i]);
+            try
+            {
+                result[i] = reader.Inspect(paths[i]);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A file that disappears or cannot be opened must not stop the whole folder.
+                result[i] = new LogFileInfo(paths[i], 0, "", "", 0, 0, null, null, $"Cannot read this file. ({ex.Message.Trim()})");
+            }
             var f = result[i];
             log?.Write("FILE", $"{Relative(folder, f.Path)}: {Reports.SizeText(f.Size)} ({f.Size:N0} bytes), log '{f.Channel}', records {f.RecordCount:N0}, "
                 + $"IDs {f.FirstRecordId}..{f.LastRecordId}, {f.First:yyyy-MM-dd HH:mm} to {f.Last:yyyy-MM-dd HH:mm}, header read in {one.ElapsedMilliseconds} ms"
@@ -45,7 +56,41 @@ public static class Scanner
         });
         log?.Write("FOLDER", $"Inventory done in {clock.Elapsed.TotalSeconds:0.0} s: {result.Count(f => f.IsRelevant)} files to scan, "
             + $"{Reports.SizeText(result.Where(f => f.IsRelevant).Sum(f => f.Size))} in total, {result.Count(f => f.Error is not null)} unreadable");
+        foreach (var (a, b) in Overlaps(result)) log?.Write("FOLDER", $"OVERLAP: {a.Name} and {b.Name} contain the same records of {a.Computer} {a.Channel}, duplicates are counted once");
         return result;
+    }
+
+    /// <summary>
+    /// Pairs of files of the same computer and log whose record ID ranges overlap: cumulative exports or an archive
+    /// next to a copy of the live log. Their shared records must be counted once.
+    /// </summary>
+    public static IEnumerable<(LogFileInfo A, LogFileInfo B)> Overlaps(IEnumerable<LogFileInfo> files)
+    {
+        foreach (var group in files.Where(f => f.IsRelevant && f.FirstRecordId > 0 && f.LastRecordId >= f.FirstRecordId)
+                     .GroupBy(f => (f.Computer.ToUpperInvariant(), f.Channel.ToUpperInvariant())))
+        {
+            var list = group.OrderBy(f => f.FirstRecordId).ToList();
+            for (var i = 0; i < list.Count; i++)
+            {
+                for (var j = i + 1; j < list.Count && list[j].FirstRecordId <= list[i].LastRecordId; j++) yield return (list[i], list[j]);
+            }
+        }
+    }
+
+    /// <summary>Lower than <paramref name="wanted"/> on machines without enough memory for it.</summary>
+    internal static int EventLimit(int wanted)
+    {
+        var available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        var fits = available > 0 ? available / 2 / BytesPerEvent : wanted;
+        return (int)Math.Max(Math.Min(wanted, 100_000), Math.Min(wanted, fits));
+    }
+
+    /// <summary>Keeps the newest <paramref name="limit"/> events. Older ones are dropped, the summary still counts them.</summary>
+    private static void KeepNewest(List<AuthEvent> list, int limit)
+    {
+        if (list.Count <= limit) return;
+        list.Sort((a, b) => b.Time.CompareTo(a.Time));
+        list.RemoveRange(limit, list.Count - limit);
     }
 
     public static ScanResult Scan(IEvtxReader reader, IReadOnlyList<LogFileInfo> files, string scope, ScanOptions options,
@@ -55,12 +100,16 @@ public static class Scanner
         var log = options.Log;
         var pool = new StringPool();
         var gate = new Lock();
+        var limit = EventLimit(options.MaxEvents);
         var events = new List<AuthEvent>();
         var summary = new Dictionary<SummaryKey, SummaryRow>(SummaryKey.Comparer);
         var results = new ConcurrentDictionary<string, FileProgress>(StringComparer.OrdinalIgnoreCase);
         var work = new ConcurrentDictionary<string, FileWork>(StringComparer.OrdinalIgnoreCase);
+        var seen = new ConcurrentDictionary<(string, string, long), byte>();
         long total = 0;
-        long kept = 0;
+        long duplicates = 0;
+        long matched = 0;
+        var failed = 0;
         var truncated = 0;
         long cancelledAt = 0;
 
@@ -78,6 +127,11 @@ public static class Scanner
             {
                 total += hits;
                 events.AddRange(localEvents);
+                if (events.Count > limit * 2L)
+                {
+                    KeepNewest(events, limit);
+                    Volatile.Write(ref truncated, 1);
+                }
                 foreach (var (key, row) in local)
                 {
                     if (summary.TryGetValue(key, out var existing)) existing.Absorb(row);
@@ -98,10 +152,14 @@ public static class Scanner
             work[relevant[i].Path] = new FileWork(relevant[i], i + 1);
             Report(new FileProgress(relevant[i].Path, FileState.Queued, 0, null, "Waiting"));
         }
+        // Only files whose record ranges overlap another file of the same log need the duplicate check.
+        var overlapping = new HashSet<string>(Overlaps(relevant).SelectMany(p => new[] { p.A.Path, p.B.Path }), StringComparer.OrdinalIgnoreCase);
 
         var threads = Math.Max(1, options.Threads);
         var mode = reader is IMultiQueryReader ? "built-in .evtx reader, one pass per file" : "Windows event log API, one pass per query";
-        log?.Write("SCAN", $"Start: {relevant.Count} files, {Reports.SizeText(relevant.Sum(f => f.Size))}, {threads} at once, {mode}, event list limit {options.MaxEvents:N0}");
+        if (reader is EvtxFileReader parser) parser.ChunkWorkers = Math.Clamp(Environment.ProcessorCount / threads, 1, 8);
+        log?.Write("SCAN", $"Start: {relevant.Count} files, {Reports.SizeText(relevant.Sum(f => f.Size))}, {threads} at once, {mode}"
+            + $"{(reader is EvtxFileReader p2 ? $", {p2.ChunkWorkers} chunk workers per file" : "")}, event list limit {limit:N0}, {overlapping.Count} files with overlapping records");
         foreach (var f in relevant)
         {
             log?.Write("SCAN", $"  [{work[f.Path].Order:00}] {f.Name} {Reports.SizeText(f.Size)} '{f.Channel}': {string.Join(", ", Queries.For(f.Channel).Select(q => q.Name))}");
@@ -124,13 +182,13 @@ public static class Scanner
                 + string.Join(", ", work.Values.Where(w => !IsIdle(w.Phase)).Select(w => $"[{w.Order:00}] {w.Phase}")));
         });
 
+        // The workers block in file reads. Make sure the thread pool has them ready instead of adding one blocked
+        // thread per second, which looked like files that never start. Restored afterwards, the setting is process-wide.
+        ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
+        if (minWorkers < threads + 2) ThreadPool.SetMinThreads(threads + 2, minIo);
         var cancelled = false;
         try
         {
-            // The workers block in the event log API. Make sure the thread pool has them ready instead of adding
-            // one blocked thread per second, which looked like files that never start.
-            ThreadPool.GetMinThreads(out var minWorkers, out var minIo);
-            if (minWorkers < threads + 2) ThreadPool.SetMinThreads(threads + 2, minIo);
             log?.Write("SCAN", SystemProbe.ThreadPoolText());
 
             // NoBuffering: a worker takes exactly one file at a time, so a waiting file starts as soon as any slot is free.
@@ -141,15 +199,48 @@ public static class Scanner
                 var w = work[file.Path];
                 w.ThreadId = Environment.CurrentManagedThreadId;
                 w.StartedAt = Stopwatch.GetTimestamp();
-                w.Enter("starting");
-                w.Life();
+                w.Start();
                 log?.Write("FILE", $"[{w.Order:00}] start {file.Name} after {clock.Elapsed.TotalSeconds:0.0} s, {SystemProbe.ThreadPoolText()}");
                 Report(new FileProgress(file.Path, FileState.Scanning, 0, 0, "Scanning"));
                 var local = new Dictionary<SummaryKey, SummaryRow>(SummaryKey.Comparer);
                 var localEvents = new List<AuthEvent>();
+                // Only the Windows API path can return a record twice within one file (two queries that both match).
+                var localSeen = reader is IMultiQueryReader ? null : new HashSet<long>();
+                var checkOverlap = overlapping.Contains(file.Path);
                 long hits = 0;
                 var lastReport = Stopwatch.StartNew();
                 var fileNote = "";
+                var partly = false;
+
+                // One matched event: skip duplicates, classify, count.
+                void Handle(RawEvent raw)
+                {
+                    Interlocked.Increment(ref w.Records);
+                    w.LastRecordId = raw.RecordId;
+                    if (raw.RecordId > 0)
+                    {
+                        // The same record can come from two queries (Windows API path) or from two overlapping files.
+                        if ((localSeen is not null && !localSeen.Add(raw.RecordId))
+                            || (checkOverlap && !seen.TryAdd((raw.Computer.ToUpperInvariant(), file.Channel, raw.RecordId), 0)))
+                        {
+                            Interlocked.Increment(ref duplicates);
+                            return;
+                        }
+                    }
+                    var e = Classifier.Classify(raw, file.Name, pool);
+                    if (e is null) return;
+                    hits++;
+                    w.Hits = hits;
+                    Interlocked.Increment(ref matched);
+                    SummaryRow.Add(local, e);
+                    localEvents.Add(e);
+                    if (localEvents.Count >= limit * 2L)
+                    {
+                        KeepNewest(localEvents, limit);
+                        Volatile.Write(ref truncated, 1);
+                    }
+                }
+
                 try
                 {
                     // Built-in parser: one pass over the file answers every query, progress comes from the bytes read.
@@ -183,16 +274,8 @@ public static class Scanner
 
                         foreach (var (_, raw) in multi.ReadAll(file.Path, queries, cancellationToken, Step, stats))
                         {
-                            Interlocked.Increment(ref w.Records);
-                            w.LastRecordId = raw.RecordId;
                             w.Life();
-                            var e = Classifier.Classify(raw, file.Name, pool);
-                            if (e is null) continue;
-                            hits++;
-                            w.Hits = hits;
-                            SummaryRow.Add(local, e);
-                            if (Interlocked.Increment(ref kept) <= options.MaxEvents) localEvents.Add(e);
-                            else Volatile.Write(ref truncated, 1);
+                            Handle(raw);
                         }
                         var passSeconds = passClock.Elapsed.TotalSeconds;
                         log?.Write("PARSE", $"[{w.Order:00}] {file.Name}: {passSeconds:0.0} s, "
@@ -202,92 +285,105 @@ public static class Scanner
                             fileNote = $", skipped {stats.BadChunks:N0} damaged chunks and {stats.BadRecords:N0} unreadable records";
                         }
                     }
-                    else foreach (var query in Queries.For(file.Channel))
+                    else
                     {
-                        var currentQuery = query;
-                        var queryClock = Stopwatch.StartNew();
-                        long queryRecords = 0, queryHits = 0, querySlices = 0;
-                        var firstLife = TimeSpan.Zero;
-                        w.Query = query.Name;
-                        w.Enter("reading");
-                        w.Life();
-
-                        void Gap()
+                        var queries = Queries.For(file.Channel).ToList();
+                        for (var qi = 0; qi < queries.Count; qi++)
                         {
-                            var gap = w.Life();
-                            if (firstLife == TimeSpan.Zero) firstLife = queryClock.Elapsed;
-                            if (gap < LongGap) return;
-                            if (Interlocked.Increment(ref w.LongGaps) <= 20)
+                            var query = queries[qi];
+                            var queryIndex = qi;
+                            var queryClock = Stopwatch.StartNew();
+                            long queryRecords = 0, querySlices = 0;
+                            var firstLife = TimeSpan.Zero;
+                            w.Query = query.Name;
+                            w.Enter("reading");
+                            w.Life();
+
+                            void Gap()
                             {
-                                log?.Write("SLOW", $"[{w.Order:00}] {file.Name} {currentQuery.Name}: the event log API took {gap.TotalSeconds:0.0} s to return "
-                                    + $"(read slice {WindowsEvtxReader.ReadSlice.TotalSeconds:0.0} s), phase '{w.Phase}'");
+                                var gap = w.Life();
+                                if (firstLife == TimeSpan.Zero) firstLife = queryClock.Elapsed;
+                                if (gap < LongGap) return;
+                                if (Interlocked.Increment(ref w.LongGaps) <= 20)
+                                {
+                                    log?.Write("SLOW", $"[{w.Order:00}] {file.Name} {query.Name}: the event log API took {gap.TotalSeconds:0.0} s to return "
+                                        + $"(read slice {WindowsEvtxReader.ReadSlice.TotalSeconds:0.0} s), phase '{w.Phase}'");
+                                }
                             }
-                        }
 
-                        void Alive()
-                        {
-                            querySlices++;
-                            Interlocked.Increment(ref w.Slices);
-                            Gap();
-                            if (lastReport.Elapsed <= ProgressInterval) return;
-                            Report(new FileProgress(file.Path, FileState.Scanning, hits, null,
-                                hits == 0 ? $"{currentQuery.Name}: reading, nothing matched yet" : $"{currentQuery.Name}: reading, {hits:N0} found so far"));
-                            lastReport.Restart();
-                        }
-
-                        foreach (var raw in reader.Read(file.Path, query, cancellationToken, Alive))
-                        {
-                            queryRecords++;
-                            Interlocked.Increment(ref w.Records);
-                            w.LastRecordId = raw.RecordId;
-                            Gap();
-                            var e = Classifier.Classify(raw, file.Name, pool);
-                            if (e is null) continue;
-                            hits++;
-                            queryHits++;
-                            w.Hits = hits;
-                            SummaryRow.Add(local, e);
-                            if (Interlocked.Increment(ref kept) <= options.MaxEvents) localEvents.Add(e);
-                            else Volatile.Write(ref truncated, 1);
-                            if (lastReport.Elapsed > ProgressInterval)
+                            void Alive()
                             {
-                                Report(new FileProgress(file.Path, FileState.Scanning, hits, Percent(file, raw.RecordId), $"{query.Name}: {hits:N0} found"));
+                                querySlices++;
+                                Interlocked.Increment(ref w.Slices);
+                                Gap();
+                                if (lastReport.Elapsed <= ProgressInterval) return;
+                                Report(new FileProgress(file.Path, FileState.Scanning, hits, null,
+                                    hits == 0 ? $"{query.Name}: reading, nothing matched yet" : $"{query.Name}: reading, {hits:N0} found so far"));
                                 lastReport.Restart();
                             }
+
+                            try
+                            {
+                                foreach (var raw in reader.Read(file.Path, query, cancellationToken, Alive))
+                                {
+                                    queryRecords++;
+                                    Gap();
+                                    Handle(raw);
+                                    if (lastReport.Elapsed > ProgressInterval)
+                                    {
+                                        // Every query reads the file from the start, so its share is scaled into the file's total.
+                                        var share = Percent(file, raw.RecordId) is { } pct ? (queryIndex + pct) / queries.Count : (double?)null;
+                                        Report(new FileProgress(file.Path, FileState.Scanning, hits, share, $"{query.Name}: {hits:N0} found"));
+                                        lastReport.Restart();
+                                    }
+                                }
+                            }
+                            catch (EventLogException ex) when (!cancellationToken.IsCancellationRequested)
+                            {
+                                // A damaged part ends this query only. The other queries still read the file.
+                                partly = true;
+                                fileNote += $", {query.Name} stopped: {ex.Message.Trim()}";
+                                log?.Write("FILE", $"[{w.Order:00}] {file.Name} {query.Name} stopped after {queryRecords:N0} records: {ex.GetType().Name}: {ex.Message.Trim()}");
+                            }
+                            var seconds = queryClock.Elapsed.TotalSeconds;
+                            log?.Write("QUERY", $"[{w.Order:00}] {file.Name} {query.Name}: {seconds:0.0} s, {queryRecords:N0} records, "
+                                + $"{querySlices:N0} empty slices, first return after {firstLife.TotalSeconds:0.0} s, {(seconds > 0 ? queryRecords / seconds : 0):0} records/s");
                         }
-                        var seconds = queryClock.Elapsed.TotalSeconds;
-                        log?.Write("QUERY", $"[{w.Order:00}] {file.Name} {query.Name}: {seconds:0.0} s, {queryRecords:N0} records, {queryHits:N0} found, "
-                            + $"{querySlices:N0} empty slices, first return after {firstLife.TotalSeconds:0.0} s, {(seconds > 0 ? queryRecords / seconds : 0):0} records/s");
                     }
                     w.Enter("merging");
                     Merge(local, localEvents, hits);
-                    w.Enter("done");
+                    w.Enter(partly ? "error" : "done");
                     var took = Stopwatch.GetElapsedTime(w.StartedAt).TotalSeconds;
-                    log?.Write("FILE", $"[{w.Order:00}] done {file.Name} in {took:0.0} s, {hits:N0} found, {Reports.SizeText((long)(file.Size / Math.Max(0.001, took)))}/s");
-                    Report(new FileProgress(file.Path, FileState.Done, hits, 1, (hits == 0 ? "Nothing found" : $"{hits:N0} events found") + fileNote));
+                    log?.Write("FILE", $"[{w.Order:00}] done {file.Name} in {took:0.0} s, {hits:N0} found, {Reports.SizeText((long)(file.Size / Math.Max(0.001, took)))}/s{fileNote}");
+                    if (partly)
+                    {
+                        Interlocked.Increment(ref failed);
+                        Report(new FileProgress(file.Path, FileState.Error, hits, null, $"Partly read, {hits:N0} events found{fileNote}"));
+                    }
+                    else
+                    {
+                        Report(new FileProgress(file.Path, FileState.Done, hits, 1, (hits == 0 ? "Nothing found" : $"{hits:N0} events found") + fileNote));
+                    }
                 }
                 catch (OperationCanceledException)
                 {
                     Merge(local, localEvents, hits);
                     w.Enter("cancelled");
-                    var at = Interlocked.Read(ref cancelledAt);
-                    var since = at > 0 ? Stopwatch.GetElapsedTime(at).TotalSeconds : 0;
+                    Interlocked.CompareExchange(ref cancelledAt, Stopwatch.GetTimestamp(), 0);
+                    var since = Stopwatch.GetElapsedTime(Interlocked.Read(ref cancelledAt)).TotalSeconds;
                     log?.Write("FILE", $"[{w.Order:00}] cancelled {file.Name} after {Stopwatch.GetElapsedTime(w.StartedAt).TotalSeconds:0.0} s, stopped {since:0.0} s after the cancel");
                     Report(new FileProgress(file.Path, FileState.Cancelled, hits, null, "Cancelled"));
                     throw;
                 }
-                catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException or System.Xml.XmlException)
+                catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
+                    // Whatever goes wrong with one file stays with that file: its partial results are kept, the
+                    // others go on. Only running out of memory ends the scan.
                     Merge(local, localEvents, hits);
                     w.Enter("error");
-                    log?.Error("FILE", $"[{w.Order:00}] {file.Name} {w.Query}", ex);
+                    Interlocked.Increment(ref failed);
+                    log?.Write("FILE", $"[{w.Order:00}] {file.Name} {w.Query} failed: {Describe(ex)}");
                     Report(new FileProgress(file.Path, FileState.Error, hits, null, ex.Message.Trim()));
-                }
-                catch (Exception ex)
-                {
-                    w.Enter("error");
-                    log?.Error("FILE", $"[{w.Order:00}] {file.Name} {w.Query} unexpected", ex);
-                    throw;
                 }
             });
         }
@@ -307,19 +403,31 @@ public static class Scanner
         }
         finally
         {
+            ThreadPool.GetMinThreads(out _, out var currentIo);
+            ThreadPool.SetMinThreads(minWorkers, currentIo);
             if (windows is not null && log is not null) windows.OnPhase = null;
-            monitor?.Tick();
+            monitor?.FinalTick();
         }
 
+        if (events.Count > limit || Interlocked.Read(ref matched) > limit) truncated = 1;
+        KeepNewest(events, limit);
         events.Sort((a, b) => a.Time.CompareTo(b.Time));
         var rows = summary.Values
             .OrderBy(r => KindOrder(r.Kind))
             .ThenByDescending(r => r.Count)
             .ToList();
         log?.Write("SCAN", $"{(cancelled ? "Cancelled" : "Finished")} after {clock.Elapsed.TotalSeconds:0.0} s: {total:N0} events, {rows.Count:N0} summary rows, "
-            + $"{results.Values.Count(r => r.State == FileState.Error)} files with errors, stalls logged {monitor?.Stalls ?? 0}");
-        return new ScanResult(files, events, rows, results, total, truncated == 1, cancelled, clock.Elapsed, scope);
+            + $"{duplicates:N0} duplicates skipped, {failed} files with errors, stalls logged {monitor?.Stalls ?? 0}");
+        return new ScanResult(files, events, rows, results, total, truncated == 1, cancelled, clock.Elapsed, scope, duplicates,
+            failed + files.Count(f => !f.IsRelevant && f.Error is not null));
     }
+
+    /// <summary>
+    /// For the diagnostic log. XML and decoder messages can quote parts of the event, so only their type is written.
+    /// </summary>
+    internal static string Describe(Exception ex) => ex is System.Xml.XmlException or System.Text.DecoderFallbackException
+        ? ex.GetType().Name
+        : $"{ex.GetType().Name}: {ex.Message.Trim()}{Environment.NewLine}{ex.StackTrace}";
 
     internal static bool IsIdle(string phase) => phase is "queued" or "done" or "cancelled" or "error";
 

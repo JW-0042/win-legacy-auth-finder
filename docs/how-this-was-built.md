@@ -81,8 +81,20 @@ So the tool got its own `.evtx` parser. The format is public: a file header, 64 
 
 The hard part was not the format but matching Windows exactly. A test exports real logs and compares every record and every value with the Windows API. It found six rules nobody documents, for example that exported files renumber their record headers while the event keeps its original ID, and that Windows returns the low byte of a 16-bit signed number. After those fixes, about 79,000 records from four logs match without a single difference. CI adds the Security log.
 
+## Version 0.4.1: a full audit
+
+With the scan finally fast, I asked the agent for a full code audit of the tool and then had it fix everything it found. The list was long and most of it was the kind of thing that only shows up in real environments.
+
+- **Wrong advice is a bug.** Two of the 2026 KDCSVC warning events pointed to the wrong side, the client instead of the service account. Anonymous sessions were reported as NTLMv1 users, although Microsoft says to ignore them. A service name in event 4769 is an account, not an SPN, so the advice now says `setspn -L <account>`. These were checked against Microsoft's documentation, not guessed.
+- **New detections.** Accounts without Kerberos pre-authentication (AS-REP roasting), NTLM validation on domain controllers (4776) for networks without the new NTLM events, the blocked NTLM events, rejected LDAP binds and the channel binding summary.
+- **The parser got stricter.** It now checks the checksum of every chunk, recovers records that a crashed writer left behind, and limits nested templates so a crafted file cannot make it run forever. Since real logs do not contain these cases, a new test builds `.evtx` files byte by byte.
+- **Matching Windows, round two.** The KDC warnings are read the way the event XML shows them. A second comparison against the Windows XML found six more rules: lowercase GUIDs, line endings, whole 16-bit numbers, empty values, string arrays split into elements and whitespace-only values. Again zero differences after the fixes.
+- **Honest results.** Overlapping exports no longer count the same event twice, a file that fails half way is shown as an error instead of a silent gap, and the event list keeps the newest events instead of the oldest.
+- **The details.** Exports no longer freeze the window, CSV files use the regional separator so Excel opens them, the version is shown in the app, the command line has exit codes for incomplete scans and failed exports, and the GitHub Actions are pinned to exact commits.
+
 ## Quality gates
 
 - The build treats warnings as errors.
-- GitHub Actions builds the tool, runs all tests and scans the runner's own Security, System and Application logs on every push.
+- GitHub Actions builds the tool, runs all tests and scans the runner's own Security, System and Application logs on every push. The actions are pinned to commit hashes.
+- A release is only built when its tag matches the version in the code.
 - Releases are self-contained single-file builds with signed build provenance.

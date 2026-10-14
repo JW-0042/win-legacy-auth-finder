@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Security.Principal;
 using System.Text;
 
@@ -14,8 +15,11 @@ public interface IRecordView
     int EventId { get; }
     string Provider { get; }
 
-    /// <summary>A named EventData or UserData value, formatted like <see cref="WindowsEvtxReader"/> does, or "".</summary>
+    /// <summary>A named EventData value, formatted like <see cref="WindowsEvtxReader"/> does, or "".</summary>
     string Get(string name);
+
+    /// <summary>A named EventData value as a number, read straight from the binary value when it is numeric. Null when missing.</summary>
+    uint? Number(string name);
 }
 
 /// <summary>A reader that answers several queries in one pass over a file.</summary>
@@ -33,17 +37,34 @@ public sealed class ReadStats
     public long Chunks;
     public long EmptyChunks;
     public long BadChunks;
+    public long ChecksumErrors;
     public long Records;
+    public long RecordsPastFree;
     public long BadRecords;
     public long Candidates;
     public long Matches;
     public string? Fallback;
     public string? FirstError;
 
+    internal void Add(ReadStats o)
+    {
+        Chunks += o.Chunks;
+        EmptyChunks += o.EmptyChunks;
+        BadChunks += o.BadChunks;
+        ChecksumErrors += o.ChecksumErrors;
+        Records += o.Records;
+        RecordsPastFree += o.RecordsPastFree;
+        BadRecords += o.BadRecords;
+        Candidates += o.Candidates;
+        Matches += o.Matches;
+        FirstError ??= o.FirstError;
+    }
+
     public override string ToString() => Fallback is not null
         ? $"read with the Windows event log API ({Fallback})"
-        : $"{Bytes / 1048576.0:0} MB, {Chunks:N0} chunks ({EmptyChunks:N0} empty, {BadChunks:N0} damaged), {Records:N0} records "
-          + $"({BadRecords:N0} unreadable), {Candidates:N0} with a wanted event ID, {Matches:N0} matched{(FirstError is null ? "" : $", first problem: {FirstError}")}";
+        : $"{Bytes / 1048576.0:0} MB, {Chunks:N0} chunks ({EmptyChunks:N0} empty, {BadChunks:N0} damaged, {ChecksumErrors:N0} with a wrong checksum), "
+          + $"{Records:N0} records ({BadRecords:N0} unreadable, {RecordsPastFree:N0} recovered from a dirty chunk), {Candidates:N0} with a wanted event ID, "
+          + $"{Matches:N0} matched{(FirstError is null ? "" : $", first problem: {FirstError}")}";
 }
 
 /// <summary>
@@ -64,18 +85,24 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
 
     public DiagLog? Log { get; set; }
 
+    /// <summary>
+    /// Threads that parse the chunks of one file. The chunks of a file are independent, so a big file can be parsed
+    /// on several cores while one thread reads the disk sequentially. The scanner sets it from the CPU count.
+    /// </summary>
+    public int ChunkWorkers { get; set; } = 1;
+
     public LogFileInfo Inspect(string path)
     {
         try
         {
             return InspectFile(path);
         }
-        catch (Exception ex) when (ex is EvtxFormatException or IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            Log?.Write("INSPECT", $"{Path.GetFileName(path)}: built-in reader cannot read the header ({ex.Message}), using the Windows API");
+            Log?.Write("INSPECT", $"{Path.GetFileName(path)}: built-in reader cannot read the header ({ex.GetType().Name}: {ex.Message}), using the Windows API");
             if (Fallback is not null) return Fallback.Inspect(path);
             long size = 0;
-            try { size = new FileInfo(path).Length; } catch (IOException) { }
+            try { size = new FileInfo(path).Length; } catch (Exception sizeError) when (sizeError is IOException or UnauthorizedAccessException) { }
             return new LogFileInfo(path, size, "", "", 0, 0, null, null, $"Cannot read this file. It may be damaged or not an event log file. ({ex.Message})");
         }
     }
@@ -88,10 +115,13 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
     {
         stats ??= new ReadStats();
         string? problem = null;
+        long firstChunk = 0;
         try
         {
             using var fs = Open(path);
-            CheckHeader(ReadHeader(fs));
+            var header = ReadHeader(fs);
+            CheckHeader(header);
+            firstChunk = (long)BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8));
         }
         catch (EvtxFormatException ex)
         {
@@ -113,7 +143,7 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
             yield break;
         }
 
-        foreach (var item in Parse(path, queries, cancellationToken, progress, stats)) yield return item;
+        foreach (var item in Parse(path, firstChunk, queries, cancellationToken, progress, stats)) yield return item;
     }
 
     private static FileStream Open(string path) =>
@@ -134,7 +164,24 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
         if (major != 3) throw new EvtxFormatException($"Unknown .evtx format version {major}");
     }
 
-    private IEnumerable<(EvtxQuery, RawEvent)> Parse(string path, IReadOnlyList<EvtxQuery> queries, CancellationToken cancellationToken,
+    /// <summary>
+    /// Chunk ranges in the order Windows reads them: from the oldest chunk named in the file header to the end of the
+    /// file, then from the start of the file. A wrapped (circular) log is then read oldest first like with the API.
+    /// </summary>
+    internal static List<(long Start, int Count)> Blocks(long chunks, long oldest)
+    {
+        if (oldest < 0 || oldest >= chunks) oldest = 0;
+        var blocks = new List<(long, int)>();
+        void Range(long from, long to)
+        {
+            for (var c = from; c < to; c += ChunksPerBlock) blocks.Add((c, (int)Math.Min(ChunksPerBlock, to - c)));
+        }
+        Range(oldest, chunks);
+        Range(0, oldest);
+        return blocks;
+    }
+
+    private IEnumerable<(EvtxQuery, RawEvent)> Parse(string path, long oldest, IReadOnlyList<EvtxQuery> queries, CancellationToken cancellationToken,
         Action<double>? progress, ReadStats stats)
     {
         var wanted = new bool[65536];
@@ -145,95 +192,188 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
         }
 
         using var fs = Open(path);
-        var length = fs.Length;
-        var chunks = Math.Max(0, (length - HeaderSize) / ChunkSize);
-        var block = ArrayPool<byte>.Shared.Rent(ChunkSize * ChunksPerBlock);
-        var parser = new ChunkParser();
-        var found = new List<(EvtxQuery, RawEvent)>();
+        var chunks = Math.Max(0, (fs.Length - HeaderSize) / ChunkSize);
+        var blocks = Blocks(chunks, oldest);
+        var workers = Math.Clamp(ChunkWorkers, 1, 16);
+        var buffers = new[] { ArrayPool<byte>.Shared.Rent(ChunkSize * ChunksPerBlock), ArrayPool<byte>.Shared.Rent(ChunkSize * ChunksPerBlock) };
+        var parsers = Enumerable.Range(0, workers).Select(_ => new ChunkParser()).ToArray();
+        var results = new List<(EvtxQuery, RawEvent)>[ChunksPerBlock];
+        var chunkStats = new ReadStats[ChunksPerBlock];
+        for (var i = 0; i < ChunksPerBlock; i++)
+        {
+            results[i] = [];
+            chunkStats[i] = new ReadStats();
+        }
+
+        int ReadBlock(int b, byte[] buffer)
+        {
+            var (start, count) = blocks[b];
+            fs.Position = HeaderSize + start * ChunkSize;
+            return fs.ReadAtLeast(buffer.AsSpan(0, count * ChunkSize), count * ChunkSize, throwOnEndOfStream: false);
+        }
+
+        Task<int>? next = null;
+        long done = 0;
         try
         {
-            fs.Position = HeaderSize;
-            for (long c = 0; c < chunks; c += ChunksPerBlock)
+            for (var b = 0; b < blocks.Count; b++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var count = (int)Math.Min(ChunksPerBlock, chunks - c);
-                var read = fs.ReadAtLeast(block.AsSpan(0, count * ChunkSize), count * ChunkSize, throwOnEndOfStream: false);
-                count = read / ChunkSize;
+                var buffer = buffers[b % 2];
+                var read = next is null ? ReadBlock(b, buffer) : next.GetAwaiter().GetResult();
+                // Read ahead: the disk fetches the next block while this one is parsed.
+                var following = b + 1;
+                next = following < blocks.Count ? Task.Run(() => ReadBlock(following, buffers[following % 2]), cancellationToken) : null;
+                var count = read / ChunkSize;
                 stats.Bytes += read;
+
                 for (var i = 0; i < count; i++)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    found.Clear();
-                    ParseChunk(parser, block, i * ChunkSize, queries, wanted, stats, found);
-                    foreach (var item in found) yield return item;
+                    results[i].Clear();
+                    chunkStats[i] = new ReadStats();
                 }
-                progress?.Invoke(chunks == 0 ? 1 : Math.Min(1, (double)(c + count) / chunks));
-                if (count < Math.Min(ChunksPerBlock, chunks - c)) break;
+                if (workers == 1 || count < 2)
+                {
+                    for (var i = 0; i < count; i++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        ParseChunk(parsers[0], buffer, i * ChunkSize, queries, wanted, chunkStats[i], results[i]);
+                    }
+                }
+                else
+                {
+                    var nextChunk = -1;
+                    Parallel.For(0, workers, new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = cancellationToken }, w =>
+                    {
+                        int i;
+                        while ((i = Interlocked.Increment(ref nextChunk)) < count)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            ParseChunk(parsers[w], buffer, i * ChunkSize, queries, wanted, chunkStats[i], results[i]);
+                        }
+                    });
+                }
+                for (var i = 0; i < count; i++)
+                {
+                    stats.Add(chunkStats[i]);
+                    foreach (var item in results[i]) yield return item;
+                }
+                done += count;
+                progress?.Invoke(chunks == 0 ? 1 : Math.Min(1, (double)done / chunks));
+                if (count < blocks[b].Count) break;
             }
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(block);
+            // An abandoned read ahead must finish before its buffer goes back to the pool.
+            try { next?.Wait(); } catch (Exception) { /* the read result is not needed anymore */ }
+            ArrayPool<byte>.Shared.Return(buffers[0]);
+            ArrayPool<byte>.Shared.Return(buffers[1]);
         }
     }
 
+    /// <summary>
+    /// One chunk. Every failure inside stays inside: a damaged chunk is counted and the file goes on with the next one.
+    /// Records past the free space offset are taken only while they continue the record ID sequence, which recovers
+    /// records of a dirty log (copied while Windows was writing) without picking up stale data.
+    /// </summary>
     private static void ParseChunk(ChunkParser parser, byte[] buffer, int start, IReadOnlyList<EvtxQuery> queries, bool[] wanted,
         ReadStats stats, List<(EvtxQuery, RawEvent)> found)
     {
-        var span = buffer.AsSpan(start, ChunkSize);
-        if (!span[..8].SequenceEqual("ElfChnk\0"u8))
+        try
         {
-            if (span[..8].IndexOfAnyExcept((byte)0) < 0) stats.EmptyChunks++;
-            else stats.BadChunks++;
-            return;
-        }
-        stats.Chunks++;
-        var free = (int)BinaryPrimitives.ReadUInt32LittleEndian(span[48..]);
-        if (free < 512 || free > ChunkSize)
-        {
-            stats.BadChunks++;
-            stats.FirstError ??= $"chunk with free space offset {free}";
-            return;
-        }
-        parser.Begin(buffer, start);
-        var pos = 512;
-        while (pos + 28 <= free)
-        {
-            if (BinaryPrimitives.ReadUInt32LittleEndian(span[pos..]) != 0x00002A2A) break;
-            var size = (int)BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 4)..]);
-            if (size < 28 || pos + size > ChunkSize)
+            var span = buffer.AsSpan(start, ChunkSize);
+            if (!span[..8].SequenceEqual("ElfChnk\0"u8))
             {
-                stats.BadRecords++;
-                stats.FirstError ??= $"record with size {size}";
-                break;
+                if (span[..8].IndexOfAnyExcept((byte)0) < 0) stats.EmptyChunks++;
+                else stats.BadChunks++;
+                return;
             }
-            stats.Records++;
-            try
+            stats.Chunks++;
+            var free = (int)Math.Min(BinaryPrimitives.ReadUInt32LittleEndian(span[48..]), int.MaxValue);
+            if (free < 512 || free > ChunkSize)
             {
-                var id = (long)BinaryPrimitives.ReadUInt64LittleEndian(span[(pos + 8)..]);
-                var written = BinaryPrimitives.ReadInt64LittleEndian(span[(pos + 16)..]);
-                var record = parser.ParseRecord(start + pos + 24, start + pos + size - 4, id, written, wanted);
-                if (record is not null)
+                stats.BadChunks++;
+                stats.FirstError ??= $"chunk with free space offset {free}";
+                return;
+            }
+            if (Crc32.Compute(span[512..free]) != BinaryPrimitives.ReadUInt32LittleEndian(span[52..])) stats.ChecksumErrors++;
+
+            parser.Begin(buffer, start);
+            var pos = 512;
+            long previousId = -1;
+            while (pos <= ChunkSize - 28)
+            {
+                var pastFree = pos > free - 28;
+                if (BinaryPrimitives.ReadUInt32LittleEndian(span[pos..]) != 0x00002A2A) break;
+                var size = BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 4)..]);
+                var limit = pastFree ? ChunkSize : free;
+                // Compared as unsigned, so a huge size cannot wrap around.
+                if (size < 28 || size > (uint)(limit - pos) || BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + (int)size - 4)..]) != size)
                 {
-                    stats.Candidates++;
-                    foreach (var q in queries)
+                    if (!pastFree)
                     {
-                        if (!q.EventIds!.Contains(record.EventId)) continue;
-                        if (q.Providers is { } providers && !providers.Contains(record.Provider, StringComparer.OrdinalIgnoreCase)) continue;
-                        if (q.Filter is { } filter && !filter(record)) continue;
-                        stats.Matches++;
-                        found.Add((q, record.Materialize(q)));
-                        break;
+                        stats.BadRecords++;
+                        stats.FirstError ??= $"record with size {size}";
+                    }
+                    break;
+                }
+                var id = (long)BinaryPrimitives.ReadUInt64LittleEndian(span[(pos + 8)..]);
+                if (pastFree)
+                {
+                    if (previousId < 0 || id != previousId + 1) break;
+                    stats.RecordsPastFree++;
+                }
+                stats.Records++;
+                try
+                {
+                    var written = BinaryPrimitives.ReadInt64LittleEndian(span[(pos + 16)..]);
+                    var record = parser.ParseRecord(start + pos + 24, start + pos + (int)size - 4, id, written, wanted);
+                    if (record is not null)
+                    {
+                        stats.Candidates++;
+                        foreach (var q in queries)
+                        {
+                            if (!q.EventIds!.Contains(record.EventId)) continue;
+                            if (q.Providers is { } providers && !providers.Contains(record.Provider, StringComparer.OrdinalIgnoreCase)) continue;
+                            if (q.Filter is { } filter && !filter(record)) continue;
+                            stats.Matches++;
+                            found.Add((q, record.Materialize(q)));
+                            break;
+                        }
                     }
                 }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+                {
+                    stats.BadRecords++;
+                    stats.FirstError ??= $"{ex.GetType().Name}: {ex.Message}";
+                }
+                previousId = id;
+                pos += (int)size;
             }
-            catch (Exception ex) when (ex is EvtxFormatException or ArgumentException or IndexOutOfRangeException or OverflowException or DecoderFallbackException)
-            {
-                stats.BadRecords++;
-                stats.FirstError ??= ex.Message;
-            }
-            pos += size;
         }
+        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+        {
+            stats.BadChunks++;
+            stats.FirstError ??= $"{ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    /// <summary>Record positions of a chunk, with the same bounds checks as the scan.</summary>
+    private static List<(int Pos, int Size)> RecordPositions(byte[] buffer)
+    {
+        var positions = new List<(int, int)>();
+        var free = (int)Math.Min(BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(48)), int.MaxValue);
+        if (free < 512 || free > ChunkSize) return positions;
+        for (var pos = 512; pos <= free - 28;)
+        {
+            if (BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos)) != 0x00002A2A) break;
+            var size = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos + 4));
+            if (size < 28 || size > (uint)(free - pos)) break;
+            positions.Add((pos, (int)size));
+            pos += (int)size;
+        }
+        return positions;
     }
 
     /// <summary>Every record of the file with all its values. For the tests that compare the parser with the Windows API.</summary>
@@ -249,27 +389,23 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
         {
             if (!ReadChunk(fs, c, buffer)) continue;
             stats.Chunks++;
-            var free = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(48));
             parser.Begin(buffer, 0);
             var list = new List<ParsedRecord>();
-            for (var pos = 512; pos + 28 <= Math.Min(free, ChunkSize);)
+            foreach (var (pos, size) in RecordPositions(buffer))
             {
-                if (BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos)) != 0x00002A2A) break;
-                var size = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos + 4));
-                if (size < 28 || pos + size > ChunkSize) break;
                 stats.Records++;
                 var id = (long)BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(pos + 8));
                 try
                 {
                     var r = parser.ParseRecord(pos + 24, pos + size - 4, id, BinaryPrimitives.ReadInt64LittleEndian(buffer.AsSpan(pos + 16)), null)!;
-                    list.Add(new ParsedRecord(r.RecordId, r.EventId, r.Provider, r.Time, r.ComputerName, r.ChannelName, r.Positional(), r.DataNamed(), null));
+                    list.Add(new ParsedRecord(r.RecordId, r.EventId, r.Provider, r.Time, r.ComputerName, r.ChannelName, r.Positional(), r.DataNamed(),
+                        r.XmlStyle(), null));
                 }
-                catch (Exception ex) when (ex is EvtxFormatException or ArgumentException or IndexOutOfRangeException or OverflowException)
+                catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
                     stats.BadRecords++;
-                    list.Add(new ParsedRecord(id, -1, "", default, "", "", [], [], ex.Message));
+                    list.Add(new ParsedRecord(id, -1, "", default, "", "", [], [], ([], []), ex.Message));
                 }
-                pos += size;
             }
             foreach (var r in list) yield return r;
         }
@@ -286,16 +422,11 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
         for (long c = 0; c < chunks; c++)
         {
             if (!ReadChunk(fs, c, buffer)) continue;
-            var free = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(48));
             parser.Begin(buffer, 0);
-            for (var pos = 512; pos + 28 <= Math.Min(free, ChunkSize);)
+            foreach (var (pos, size) in RecordPositions(buffer))
             {
-                if (BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos)) != 0x00002A2A) break;
-                var size = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos + 4));
-                if (size < 28) break;
                 var r = parser.ParseRecord(pos + 24, pos + size - 4, 0, 0, null);
                 if (r is not null && r.RecordId == recordId) return $"chunk {c}, offset {pos}, size {size}{Environment.NewLine}{r.Dump()}";
-                pos += size;
             }
         }
         return "not found";
@@ -315,22 +446,41 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
         if (lastNo < 0 || lastNo >= chunks) lastNo = chunks - 1;
 
         var buffer = new byte[ChunkSize];
+        // A dirty header (log copied while Windows was writing) can name an older last chunk. Follow the record
+        // numbers forward while the next chunk continues them.
+        if (ReadChunk(fs, lastNo, buffer))
+        {
+            var lastNumber = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(16));
+            for (var step = 1L; step < chunks; step++)
+            {
+                var candidate = (lastNo + 1) % chunks;
+                if (!ReadChunk(fs, candidate, buffer) || BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(8)) != lastNumber + 1) break;
+                lastNo = candidate;
+                lastNumber = BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(16));
+            }
+        }
+
         var parser = new ChunkParser();
         RecordFields? first = null, last = null;
-        long firstId = 0, lastId = 0;
-        // The header names the oldest and the newest chunk. A copied live log can be dirty, so look further when they are empty.
+        long firstId = 0, lastId = 0, firstNumber = 0, lastNumberFound = 0;
         for (var i = 0L; i < chunks && first is null; i++)
         {
             var no = (firstNo + i) % chunks;
-            if (ReadChunk(fs, no, buffer)) (first, firstId) = EdgeRecord(parser, buffer, newest: false);
+            if (!ReadChunk(fs, no, buffer)) continue;
+            (first, firstId) = EdgeRecord(parser, buffer, newest: false);
+            firstNumber = (long)BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(8));
         }
         for (var i = 0L; i < chunks && last is null; i++)
         {
             var no = ((lastNo - i) % chunks + chunks) % chunks;
-            if (ReadChunk(fs, no, buffer)) (last, lastId) = EdgeRecord(parser, buffer, newest: true);
+            if (!ReadChunk(fs, no, buffer)) continue;
+            (last, lastId) = EdgeRecord(parser, buffer, newest: true);
+            lastNumberFound = (long)BinaryPrimitives.ReadUInt64LittleEndian(buffer.AsSpan(16));
         }
         if (first is null || last is null) return new LogFileInfo(path, length, "(empty)", "", 0, 0, null, null);
-        var count = lastId >= firstId ? lastId - firstId + 1 : 0;
+        // Record numbers in the chunk headers are contiguous in the file, also for filtered exports where the
+        // event IDs have gaps.
+        var count = lastNumberFound >= firstNumber && firstNumber > 0 ? lastNumberFound - firstNumber + 1 : Math.Max(0, lastId - firstId + 1);
         return new LogFileInfo(path, length, first.ChannelName, first.ComputerName, count, firstId, first.Time, last.Time,
             FirstRecordId: firstId, LastRecordId: lastId);
     }
@@ -344,17 +494,7 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
     /// <summary>The first or the last readable record of a chunk, decoded in full.</summary>
     private static (RecordFields?, long) EdgeRecord(ChunkParser parser, byte[] buffer, bool newest)
     {
-        var free = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(48));
-        if (free < 512 || free > ChunkSize) return (null, 0);
-        var positions = new List<(int Pos, int Size)>();
-        for (var pos = 512; pos + 28 <= free;)
-        {
-            if (BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos)) != 0x00002A2A) break;
-            var size = (int)BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(pos + 4));
-            if (size < 28 || pos + size > ChunkSize) break;
-            positions.Add((pos, size));
-            pos += size;
-        }
+        var positions = RecordPositions(buffer);
         if (newest) positions.Reverse();
         foreach (var (pos, size) in positions)
         {
@@ -366,7 +506,7 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
                 var record = parser.ParseRecord(pos + 24, pos + size - 4, id, written, null);
                 if (record is not null && record.ChannelName.Length > 0) return (record.Detach(), record.RecordId);
             }
-            catch (Exception ex) when (ex is EvtxFormatException or ArgumentException or IndexOutOfRangeException or OverflowException or DecoderFallbackException)
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
                 // Try the next record.
             }
@@ -375,8 +515,46 @@ public sealed class EvtxFileReader(IEvtxReader? fallback = null) : IEvtxReader, 
     }
 }
 
+/// <summary>CRC-32 (IEEE), the checksum of .evtx chunks. Slicing by 8 keeps it fast enough for 4 GB files.</summary>
+internal static class Crc32
+{
+    private static readonly uint[] Table = Build();
+
+    private static uint[] Build()
+    {
+        var t = new uint[8 * 256];
+        for (uint i = 0; i < 256; i++)
+        {
+            var c = i;
+            for (var k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+        for (var i = 0; i < 256; i++)
+        {
+            for (var s = 1; s < 8; s++) t[s * 256 + i] = (t[(s - 1) * 256 + i] >> 8) ^ t[t[(s - 1) * 256 + i] & 0xFF];
+        }
+        return t;
+    }
+
+    public static uint Compute(ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFFu;
+        var t = Table;
+        while (data.Length >= 8)
+        {
+            var one = BinaryPrimitives.ReadUInt32LittleEndian(data) ^ crc;
+            var two = BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
+            crc = t[7 * 256 + (one & 0xFF)] ^ t[6 * 256 + ((one >> 8) & 0xFF)] ^ t[5 * 256 + ((one >> 16) & 0xFF)] ^ t[4 * 256 + (one >> 24)]
+                ^ t[3 * 256 + (two & 0xFF)] ^ t[2 * 256 + ((two >> 8) & 0xFF)] ^ t[256 + ((two >> 16) & 0xFF)] ^ t[two >> 24];
+            data = data[8..];
+        }
+        foreach (var b in data) crc = t[(crc ^ b) & 0xFF] ^ (crc >> 8);
+        return ~crc;
+    }
+}
+
 internal sealed record ParsedRecord(long RecordId, int EventId, string Provider, DateTime Time, string Computer, string Channel,
-    List<string> Positional, Dictionary<string, string> Named, string? Error);
+    List<string> Positional, Dictionary<string, string> Named, (Dictionary<string, string> Data, List<string> Values) Xml, string? Error);
 
 internal enum Slot : byte
 {
@@ -433,11 +611,15 @@ internal sealed class ChunkParser
     private const int MaxDepth = 64;
     private const int MaxNesting = 8;
 
+    /// <summary>Nested binary XML values one record may expand. Real events use one or two, crafted files could use millions.</summary>
+    internal const int MaxExpansions = 256;
+
     private byte[] _b = [];
     private int _start;
     private int _end;
     private readonly Dictionary<int, string> _names = [];
-    private readonly Dictionary<(int, string), Template?> _templates = [];
+    private readonly Dictionary<int, Template?> _topTemplates = [];
+    private readonly Dictionary<(int, string), Template?> _nestedTemplates = [];
     private readonly RecordFields _fields;
 
     public ChunkParser() => _fields = new RecordFields(this);
@@ -446,19 +628,19 @@ internal sealed class ChunkParser
     public void Begin(byte[] buffer, int start)
     {
         _names.Clear();
-        _templates.Clear();
+        _topTemplates.Clear();
+        _nestedTemplates.Clear();
         _b = buffer;
         _start = start;
         _end = start + EvtxFileReader.ChunkSize;
     }
-
-    public byte[] Buffer => _b;
 
     /// <summary>Parses one record. Returns null when its event ID is not wanted (checked before the full decode).</summary>
     public RecordFields? ParseRecord(int pos, int end, long recordId, long written, bool[]? wanted)
     {
         var f = _fields;
         f.Reset(recordId, written);
+        if (end < pos) throw new EvtxFormatException("Record is shorter than its header");
         Fragment(pos, end, "", 0, wanted);
         if (f.Skipped) return null;
         f.ResolveSystem();
@@ -557,7 +739,12 @@ internal sealed class ChunkParser
     {
         var definition = I32(pos + 6);
         pos += 10;
-        if (definition == Rel(pos)) pos += 24 + I32(pos + 20);
+        if (definition == Rel(pos))
+        {
+            var inline = I32(pos + 20);
+            if (inline < 0) throw new EvtxFormatException("Template with a negative size");
+            pos += 24 + inline;
+        }
         var template = GetTemplate(definition, context);
         var count = I32(pos);
         if (count < 0 || count > 8192) throw new EvtxFormatException($"Template instance with {count} values");
@@ -586,11 +773,19 @@ internal sealed class ChunkParser
     }
 
     /// <summary>Called for a substitution of type binary XML: the value is a fragment of its own.</summary>
-    internal void Nested(SubValue sub, string context, int nesting) => Fragment(sub.Offset, sub.Offset + sub.Size, context, nesting + 1, null);
+    internal void Nested(SubValue sub, string context, int nesting)
+    {
+        if (++_fields.Expansions > MaxExpansions) throw new EvtxFormatException("Too many nested binary XML values in one record");
+        Fragment(sub.Offset, sub.Offset + sub.Size, context, nesting + 1, null);
+    }
 
     private Template GetTemplate(int offset, string context)
     {
-        if (_templates.TryGetValue((offset, context), out var cached)) return cached ?? throw new EvtxFormatException("Damaged template");
+        var top = context.Length == 0;
+        if (top ? _topTemplates.TryGetValue(offset, out var cached) : _nestedTemplates.TryGetValue((offset, context), out cached))
+        {
+            return cached ?? throw new EvtxFormatException("Damaged template");
+        }
         try
         {
             var p = _start + offset;
@@ -609,12 +804,14 @@ internal sealed class ChunkParser
                 else throw new EvtxFormatException($"Unexpected token 0x{token:x2} in a template");
             }
             var template = new Template(bindings);
-            _templates[(offset, context)] = template;
+            if (top) _topTemplates[offset] = template;
+            else _nestedTemplates[(offset, context)] = template;
             return template;
         }
         catch (EvtxFormatException)
         {
-            _templates[(offset, context)] = null;
+            if (top) _topTemplates[offset] = null;
+            else _nestedTemplates[(offset, context)] = null;
             throw;
         }
     }
@@ -812,6 +1009,9 @@ internal sealed class ChunkParser
 /// <summary>The decoded parts of one record. Reused for every record of a pass, so nothing here may be kept.</summary>
 internal sealed class RecordFields(ChunkParser parser) : IRecordView
 {
+    /// <summary>Substitution values one record may hold, nested instances included.</summary>
+    internal const int MaxSubs = 65536;
+
     private readonly List<(Binding Binding, int First)> _entries = [];
 
     // Sources of the positional values: a binding of the outer template, or (binding null) every value of a nested
@@ -819,35 +1019,48 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
     private readonly List<(Binding? Binding, int First, int Count)> _positional = [];
     internal SubValue[] Subs = new SubValue[256];
     private int _subCount;
-    private string? _provider;
+
+    // System fields are found by ResolveSystem but decoded only when asked for. Most candidates are filtered out first.
+    private (Binding? B, int First) _computerAt, _channelAt, _recordIdAt, _timeAt;
+    private string? _provider, _computer, _channel;
+    private long? _recordId;
+    private DateTime? _time;
+    private long _headerId;
 
     public bool Skipped;
-    public long RecordId;
+    public int Expansions;
     public long Written;
     public int EventId { get; private set; } = -1;
     public string Provider => _provider ??= Text(Slot.Provider);
-    public string ComputerName { get; private set; } = "";
-    public string ChannelName { get; private set; } = "";
-    public DateTime Time { get; private set; }
+    public string ComputerName => _computer ??= _computerAt.B is { } b ? Join(b.Pieces, _computerAt.First, "") : "";
+    public string ChannelName => _channel ??= _channelAt.B is { } b ? Join(b.Pieces, _channelAt.First, "") : "";
+
+    /// <summary>Exported logs renumber the record headers from 1, the event itself keeps its original ID in System/EventRecordID.</summary>
+    public long RecordId => _recordId ??= _recordIdAt.B is { } b && Long(b, _recordIdAt.First) is > 0 and var original ? original : _headerId;
+
+    public DateTime Time => _time ??= _timeAt.B is { } b && TimeOf(b, _timeAt.First) is { } t ? t : DateTime.FromFileTime(Written);
 
     public void Reset(long recordId, long written)
     {
         _entries.Clear();
         _positional.Clear();
         _subCount = 0;
-        _provider = null;
+        _provider = _computer = _channel = null;
+        _recordId = null;
+        _time = null;
+        _computerAt = _channelAt = _recordIdAt = _timeAt = default;
         Skipped = false;
-        RecordId = recordId;
+        Expansions = 0;
+        _headerId = recordId;
         Written = written;
         EventId = -1;
-        ComputerName = "";
-        ChannelName = "";
     }
 
     public int ReserveSubs(int count)
     {
         var first = _subCount;
         _subCount += count;
+        if (_subCount > MaxSubs) throw new EvtxFormatException("Too many substitution values in one record");
         if (_subCount > Subs.Length) Array.Resize(ref Subs, Math.Max(_subCount, Subs.Length * 2));
         return first;
     }
@@ -887,6 +1100,7 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
         return true;
     }
 
+    /// <summary>Finds the system fields. Only the event ID is decoded here, the rest when it is used.</summary>
     public void ResolveSystem()
     {
         foreach (var (b, first) in _entries)
@@ -897,21 +1111,19 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
                     EventId = Number(b, first) is { } n and >= 0 and <= 0xFFFF ? n : -1;
                     break;
                 case Slot.Computer:
-                    ComputerName = Join(b.Pieces, first, "");
+                    _computerAt = (b, first);
                     break;
                 case Slot.Channel:
-                    ChannelName = Join(b.Pieces, first, "");
+                    _channelAt = (b, first);
                     break;
                 case Slot.Time:
-                    Time = TimeOf(b, first);
+                    _timeAt = (b, first);
                     break;
                 case Slot.RecordId:
-                    // Exported logs renumber the record headers from 1, the event itself keeps its original ID.
-                    if (long.TryParse(Join(b.Pieces, first, ""), out var original) && original > 0) RecordId = original;
+                    _recordIdAt = (b, first);
                     break;
             }
         }
-        if (Time == default) Time = DateTime.FromFileTime(Written);
     }
 
     /// <summary>A number from a single substitution or literal, used for the event ID.</summary>
@@ -931,10 +1143,41 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
         };
     }
 
-    private DateTime TimeOf(Binding b, int first)
+    private long? Long(Binding b, int first)
+    {
+        if (b.Pieces is [{ Sub: >= 0 } p] && TryGet(first, p.Sub, out var sub) && sub.Size == 8 && sub.Type is 0x09 or 0x0A or 0x15)
+        {
+            return (long)parser.U64(sub.Offset);
+        }
+        return long.TryParse(Join(b.Pieces, first, ""), out var parsed) ? parsed : null;
+    }
+
+    public uint? Number(string name)
+    {
+        foreach (var (b, first) in _entries)
+        {
+            if (b.Slot != Slot.Data || NameOf(b, first) != name) continue;
+            if (b.Pieces is [{ Sub: >= 0 } p] && TryGet(first, p.Sub, out var sub) && sub.Size > 0)
+            {
+                switch (sub.Type)
+                {
+                    case 0x04: return parser.U8(sub.Offset);
+                    case 0x06: return parser.U16(sub.Offset);
+                    case 0x07 or 0x08 or 0x14 when sub.Size >= 4: return parser.U32(sub.Offset);
+                    case 0x09 or 0x0A or 0x15 when sub.Size >= 8:
+                        var wide = parser.U64(sub.Offset);
+                        return wide <= uint.MaxValue ? (uint)wide : null;
+                }
+            }
+            return Classifier.ParseEtype(Join(b.Pieces, first, name));
+        }
+        return null;
+    }
+
+    private DateTime? TimeOf(Binding b, int first)
     {
         if (b.Pieces is [{ Sub: >= 0 } p] && TryGet(first, p.Sub, out var sub) && Value(sub) is DateTime t) return t;
-        return default;
+        return null;
     }
 
     private string Text(Slot slot)
@@ -960,11 +1203,12 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
 
     private string NameOf(Binding b, int first) => b.Name ?? (b.NamePieces is { } np ? Join(np, first, "") : "");
 
+    /// <summary>A named EventData value, exactly what the property selector Event/EventData/Data[@Name='x'] returns.</summary>
     public string Get(string name)
     {
         foreach (var (b, first) in _entries)
         {
-            if (b.Slot is not (Slot.Data or Slot.UserLeaf)) continue;
+            if (b.Slot != Slot.Data) continue;
             if (NameOf(b, first) != name) continue;
             return Join(b.Pieces, first, name);
         }
@@ -1006,12 +1250,99 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
                     {
                         foreach (var item in array) values.Add(WindowsEvtxReader.Format("", item));
                     }
+                    else if (value is not Array)
+                    {
+                        // A damaged array came back as hex text: keep it in its place so later positions do not shift.
+                        values.Add(WindowsEvtxReader.Format("", value));
+                    }
                     continue;
                 }
                 values.Add(WindowsEvtxReader.Format("", value));
             }
         }
         return values;
+    }
+
+    /// <summary>
+    /// EventData and UserData the way the Windows reader's XML fallback sees them (<see cref="WindowsEvtxReader.EventDataFromXml"/>):
+    /// one entry per Data element, "ParamN" for unnamed ones, a string array as one element per string, UserData leaves by element name, values rendered like the event XML (hex with 0x, GUIDs in braces, ISO times).
+    /// </summary>
+    public (Dictionary<string, string> Data, List<string> Values) XmlStyle()
+    {
+        var data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var values = new List<string>();
+        var i = 0;
+        foreach (var (b, first) in _entries)
+        {
+            if (b.Slot is not (Slot.Data or Slot.UserLeaf)) continue;
+            var name = NameOf(b, first);
+            // The XML writes a string array as one element per string, named ones repeat the name.
+            if (b.Pieces.Count(p => p.Sub >= 0) == 1
+                && b.Pieces.All(p => p.Sub >= 0 || string.IsNullOrWhiteSpace(p.Literal))
+                && TryGet(first, b.Pieces.First(p => p.Sub >= 0).Sub, out var arraySub)
+                && (arraySub.Type & 0x80) != 0 && Value(arraySub) is string[] strings)
+            {
+                foreach (var text in strings)
+                {
+                    if (b.Slot == Slot.Data) i++;
+                    var item = XmlBlank(XmlLines(text));
+                    data[name.Length > 0 ? name : $"Param{i}"] = item;
+                    values.Add(item);
+                }
+                continue;
+            }
+            // An unnamed Data element with only a null value is not rendered at all.
+            if (b.Slot == Slot.Data && name.Length == 0 && b.Pieces.Length > 0
+                && b.Pieces.All(p => p.Sub >= 0 && (!TryGet(first, p.Sub, out var s) || s.Type == 0x00)))
+            {
+                continue;
+            }
+            if (b.Slot == Slot.Data) i++;
+            var value = XmlBlank(XmlJoin(b.Pieces, first));
+            data[name.Length > 0 ? name : $"Param{i}"] = value;
+            values.Add(value);
+        }
+        return (data, values);
+    }
+
+    private string XmlJoin(Piece[] pieces, int first)
+    {
+        var sb = new StringBuilder();
+        foreach (var p in pieces)
+        {
+            if (p.Sub < 0) sb.Append(XmlLines(p.Literal ?? ""));
+            else if (TryGet(first, p.Sub, out var sub)) sb.Append(XmlText(sub));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Reading XML turns CR LF and a lone CR into LF.</summary>
+    private static string XmlLines(string text) => text.Contains('\r') ? text.Replace("\r\n", "\n").Replace('\r', '\n') : text;
+
+    /// <summary>Parsing the XML drops a text node that is only whitespace.</summary>
+    private static string XmlBlank(string text) => text.Length > 0 && text.All(c => c is ' ' or '\t' or '\n') ? "" : text;
+
+    /// <summary>A value as the event XML renders it.</summary>
+    private string XmlText(SubValue sub)
+    {
+        // Unlike its property values, the XML of an event shows an Int16 as the full number.
+        if (sub.Type == 0x05 && sub.Size >= 2) return ((short)parser.U16(sub.Offset)).ToString(CultureInfo.InvariantCulture);
+        var value = Value(sub);
+        return value switch
+        {
+            null => "",
+            string s => XmlLines(s),
+            bool flag => flag ? "true" : "false",
+            Guid g => "{" + g.ToString("D") + "}",
+            DateTime t => t.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture),
+            byte[] bytes => Convert.ToHexString(bytes),
+            SecurityIdentifier sid => sid.Value,
+            int i when sub.Type == 0x14 => $"0x{i:x}",
+            ulong u when sub.Type is 0x15 or 0x10 => $"0x{u:x}",
+            string[] items => XmlLines(string.Concat(items.Select(x => "\n" + x))),
+            IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+            _ => value.ToString() ?? "",
+        };
     }
 
     /// <summary>What the parser saw in the current record, for debugging.</summary>
@@ -1047,22 +1378,6 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
         return data;
     }
 
-    /// <summary>All named values, with "ParamN" for unnamed Data elements, like the XML fallback of the Windows reader.</summary>
-    public Dictionary<string, string> AllNamed()
-    {
-        var data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var i = 0;
-        foreach (var (b, first) in _entries)
-        {
-            if (b.Slot is not (Slot.Data or Slot.UserLeaf)) continue;
-            if (b.Slot == Slot.Data) i++;
-            var name = NameOf(b, first);
-            if (name.Length == 0) name = $"Param{i}";
-            data[name] = Join(b.Pieces, first, name);
-        }
-        return data;
-    }
-
     public RawEvent Materialize(EvtxQuery q)
     {
         Dictionary<string, string> data;
@@ -1074,8 +1389,9 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
         }
         else if (q.Fields is null)
         {
-            data = AllNamed();
-            values = Positional();
+            // The Windows reader renders these events as XML, so render the same way.
+            (data, var xmlValues) = XmlStyle();
+            values = xmlValues;
         }
         else
         {
@@ -1092,19 +1408,33 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
     /// <summary>A copy of the system fields that survives the next record.</summary>
     public RecordFields Detach()
     {
-        var copy = new RecordFields(parser) { RecordId = RecordId, Written = Written };
+        var copy = new RecordFields(parser) { Written = Written };
         copy.EventId = EventId;
         copy._provider = Provider;
-        copy.ComputerName = ComputerName;
-        copy.ChannelName = ChannelName;
-        copy.Time = Time;
+        copy._computer = ComputerName;
+        copy._channel = ChannelName;
+        copy._recordId = RecordId;
+        copy._time = Time;
         return copy;
     }
 
     /// <summary>
     /// Decodes a substitution value into the same .NET types the Windows reader returns, so formatting is identical.
+    /// A value that does not decode (an impossible date, a broken SID) comes back as hex text instead of failing the record.
     /// </summary>
     public object? Value(SubValue sub)
+    {
+        try
+        {
+            return Decode(sub);
+        }
+        catch (Exception ex) when (ex is ArgumentException or OverflowException or FormatException)
+        {
+            return Convert.ToHexString(parser.Bytes(sub.Offset, sub.Size));
+        }
+    }
+
+    private object? Decode(SubValue sub)
     {
         var p = sub.Offset;
         var n = sub.Size;
@@ -1113,11 +1443,21 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
             // An empty array is still an array for the Windows reader. Only the null type is null.
             return sub.Type switch
             {
-                0x81 => System.Array.Empty<string>(),
+                0x81 or 0x82 => System.Array.Empty<string>(),
+                0x83 => System.Array.Empty<sbyte>(),
+                0x84 => System.Array.Empty<byte>(),
+                0x85 => System.Array.Empty<short>(),
                 0x86 => System.Array.Empty<ushort>(),
+                0x87 or 0x94 => System.Array.Empty<int>(),
                 0x88 => System.Array.Empty<uint>(),
-                0x8A or 0x95 => System.Array.Empty<ulong>(),
-                0x94 => System.Array.Empty<int>(),
+                0x89 => System.Array.Empty<long>(),
+                0x8A or 0x90 or 0x95 => System.Array.Empty<ulong>(),
+                0x8B => System.Array.Empty<float>(),
+                0x8C => System.Array.Empty<double>(),
+                0x8D => System.Array.Empty<bool>(),
+                0x8F => System.Array.Empty<Guid>(),
+                0x91 or 0x92 => System.Array.Empty<DateTime>(),
+                0x93 => System.Array.Empty<SecurityIdentifier>(),
                 _ => null,
             };
         }
@@ -1150,9 +1490,26 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
                 var text = Encoding.Unicode.GetString(parser.Bytes(p, n & ~1));
                 if (text.EndsWith('\0')) text = text[..^1];
                 return text.Split('\0');
+            case 0x82:
+                var ansi = Encoding.Latin1.GetString(parser.Bytes(p, n));
+                if (ansi.EndsWith('\0')) ansi = ansi[..^1];
+                return ansi.Split('\0');
+            case 0x83: return ReadArray(p, n, 1, i => (sbyte)parser.U8(i));
+            case 0x84: return parser.Bytes(p, n).ToArray();
+            case 0x85: return ReadArray(p, n, 2, i => (short)parser.U16(i));
             case 0x86: return ReadArray(p, n, 2, i => parser.U16(i));
+            case 0x87: return ReadArray(p, n, 4, i => (int)parser.U32(i));
             case 0x88: return ReadArray(p, n, 4, i => parser.U32(i));
+            case 0x89: return ReadArray(p, n, 8, i => (long)parser.U64(i));
             case 0x8A: return ReadArray(p, n, 8, i => parser.U64(i));
+            case 0x8B: return ReadArray(p, n, 4, i => BitConverter.Int32BitsToSingle((int)parser.U32(i)));
+            case 0x8C: return ReadArray(p, n, 8, i => BitConverter.Int64BitsToDouble((long)parser.U64(i)));
+            case 0x8D: return ReadArray(p, n, 4, i => parser.U32(i) != 0);
+            case 0x8F: return ReadArray(p, n, 16, i => new Guid(parser.Bytes(i, 16)));
+            case 0x90: return ReadArray(p, n, 8, i => parser.U64(i));
+            case 0x91: return ReadArray(p, n, 8, i => DateTime.FromFileTime((long)parser.U64(i)));
+            case 0x92: return ReadArray(p, n, 16, SystemTime);
+            case 0x93: return Sids(p, n);
             case 0x94: return ReadArray(p, n, 4, i => (int)parser.U32(i));
             case 0x95: return ReadArray(p, n, 8, i => parser.U64(i));
             default: return parser.Bytes(p, n).ToArray();
@@ -1164,6 +1521,21 @@ internal sealed class RecordFields(ChunkParser parser) : IRecordView
         var result = new T[n / size];
         for (var i = 0; i < result.Length; i++) result[i] = read(p + i * size);
         return result;
+    }
+
+    /// <summary>SIDs one after another: each is 8 bytes plus 4 per sub-authority (count at byte 1).</summary>
+    private SecurityIdentifier[] Sids(int p, int n)
+    {
+        var list = new List<SecurityIdentifier>();
+        var end = p + n;
+        while (p + 8 <= end)
+        {
+            var length = 8 + parser.U8(p + 1) * 4;
+            if (p + length > end) break;
+            list.Add(new SecurityIdentifier(parser.Bytes(p, length).ToArray(), 0));
+            p += length;
+        }
+        return [.. list];
     }
 
     private DateTime SystemTime(int p)

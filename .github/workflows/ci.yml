@@ -12,8 +12,11 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+      # Actions are pinned to commits, so a moved tag cannot change what runs here.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
       - run: dotnet build LegacyAuthFinder.slnx -c Release
@@ -39,5 +42,7 @@ jobs:
           dotnet run --project src/LegacyAuthFinder.Cli -c Release --no-build -- --demo --json demo.json --quiet
           if ($LASTEXITCODE -ne 1) { throw "Demo data should report findings" }
           $r = Get-Content demo.json | ConvertFrom-Json
-          if ($r.totals.des -lt 1 -or $r.totals.ntlmv1 -lt 1 -or $r.totals.rc4 -lt 1 -or $r.totals.ldapUnsigned -lt 1 -or $r.totals.ldapChannelBinding -lt 1 -or $r.totals.etypeErrors -lt 1) { throw "Demo should contain every type" }
+          foreach ($k in 'des','ntlmv1','rc4','ldapUnsigned','ldapChannelBinding','etypeErrors','smb1','ntlm','noPreAuth') {
+            if ($r.totals.$k -lt 1) { throw "Demo should contain every type, $k is missing" }
+          }
           exit 0

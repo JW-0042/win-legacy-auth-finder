@@ -14,8 +14,10 @@ public enum LegacyKind
     EtypeFailure,
     /// <summary>A client connected with SMB version 1 (SMBServer Audit 3000).</summary>
     Smb1,
-    /// <summary>Any NTLM authentication from the NTLM Operational log (4020 to 4023, 4030 to 4033, 8001 to 8004).</summary>
+    /// <summary>Any NTLM authentication: NTLM Operational log (4001 to 4003, 4020 to 4027, 4030 to 4033, 8001 to 8004) and 4776 on domain controllers.</summary>
     Ntlm,
+    /// <summary>A TGT issued without Kerberos pre-authentication (4768 with PreAuthType 0): the account can be AS-REP roasted.</summary>
+    NoPreAuth,
 }
 
 /// <summary>One .evtx file found in the folder, before it is scanned.</summary>
@@ -107,8 +109,11 @@ public sealed record AuthEvent(
         4770 => "Kerberos ticket renewed",
         4771 => "Kerberos pre-authentication failed",
         2887 => "LDAP daily summary",
+        2888 => "LDAP daily summary, binds rejected",
         2889 => "LDAP bind without signing",
         3039 => "LDAP channel binding failed",
+        3040 => "LDAPS daily summary without channel binding",
+        4776 => "NTLM credential validation",
         3074 => "LDAP bind would fail channel binding",
         3075 => "LDAP bind without channel binding info",
         _ => Guidance.KdcEventText(EventId),
@@ -188,12 +193,13 @@ public sealed class SummaryRow
     public long Count { get; set; }
     public DateTime FirstSeen { get; set; } = DateTime.MaxValue;
     public DateTime LastSeen { get; set; } = DateTime.MinValue;
-    public SortedSet<string> Computers { get; } = new(StringComparer.OrdinalIgnoreCase);
-    public SortedSet<string> Variants { get; } = new(StringComparer.Ordinal);
+    // Hash sets: cheaper than sorted sets for hundreds of thousands of rows. The text properties sort when shown.
+    public HashSet<string> Computers { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public HashSet<string> Variants { get; } = new(StringComparer.Ordinal);
 
     public string KindLabel => Guidance.Label(Kind);
-    public string ComputersText => string.Join(", ", Computers);
-    public string VariantsText => string.Join(", ", Variants);
+    public string ComputersText => string.Join(", ", Computers.Order(StringComparer.OrdinalIgnoreCase));
+    public string VariantsText => string.Join(", ", Variants.Order(StringComparer.Ordinal));
 
     public bool Matches(IReadOnlyList<string> terms) => terms.All(t =>
         Account.Contains(t, StringComparison.OrdinalIgnoreCase)
@@ -225,8 +231,13 @@ public sealed record ScanResult(
     bool Truncated,
     bool Cancelled,
     TimeSpan Duration,
-    string Scope)
+    string Scope,
+    long Duplicates = 0,
+    int FailedFiles = 0)
 {
+    /// <summary>True when the result does not cover every file: cancelled, or files that could not be read.</summary>
+    public bool Incomplete => Cancelled || FailedFiles > 0;
+
     private IReadOnlyList<FixItem>? _fixes;
 
     public long Count(LegacyKind kind) => Summary.Where(s => s.Kind == kind).Sum(s => s.Count);

@@ -9,6 +9,8 @@ namespace LegacyAuthFinder.Tests;
 /// Runs the real Windows event log API against logs exported from the machine running the tests.
 /// The System log can be exported without admin rights. The Security log needs admin (CI runners have it).
 /// </summary>
+/// <remarks>Changes the static read slice in one test, so it must not run next to other readers.</remarks>
+[Collection(SerialCollection.Name)]
 public sealed class WindowsReaderTests(ITestOutputHelper output) : IDisposable
 {
     private readonly string _dir = Directory.CreateTempSubdirectory("laf-").FullName;

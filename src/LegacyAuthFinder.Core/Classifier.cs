@@ -18,7 +18,7 @@ public static class Classifier
     [
         "LogonType", "AuthenticationPackageName", "LmPackageName", "KeyLength", "LogonProcessName", "ProcessName",
         "WorkstationName", "IpAddress", "Status", "SubStatus",
-        "TicketOptions", "PreAuthType", "FailureCode", "ClientAdvertizedEncryptionTypes",
+        "TicketOptions", "PreAuthType", "PreAuthEncryptionType", "FailureCode", "ClientAdvertizedEncryptionTypes",
         "AccountSupportedEncryptionTypes", "AccountAvailableKeys",
         "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
         "DCSupportedEncryptionTypes", "DCAvailableKeys",
@@ -29,15 +29,44 @@ public static class Classifier
     public static AuthEvent? Classify(RawEvent e, string file, StringPool pool) => e.EventId switch
     {
         4624 or 4625 when e.Provider is "" or Providers.SecurityAuditing => Ntlm(e, file, pool),
+        4768 when (e.Provider is "" or Providers.SecurityAuditing) && IsNoPreAuth(e) => NoPreAuth(e, file, pool),
         4768 or 4769 or 4770 or 4771 when e.Provider is "" or Providers.SecurityAuditing =>
             IsEtypeFailure(e) ? SecurityEtypeFailure(e, file, pool) : e.EventId == 4771 ? null : Kerberos(e, file, pool),
+        4776 when e.Provider is "" or Providers.SecurityAuditing => NtlmValidation(e, file, pool),
         >= 201 and <= 209 when Providers.IsKdc(e.Provider) => KdcWarning(e, file, pool),
         14 or 16 or 26 or 27 when Providers.IsKdc(e.Provider) => KdcEtypeError(e, file, pool),
-        2887 or 2889 or 3039 or 3074 or 3075 when e.Provider is "" || Providers.IsDirectoryService(e.Provider) => Ldap(e, file, pool),
-        (>= 8001 and <= 8004) or (>= 4020 and <= 4025) or (>= 4030 and <= 4033) when e.Provider is "" || Providers.IsNtlm(e.Provider) => NtlmUse(e, file, pool),
+        2887 or 2888 or 2889 or 3039 or 3040 or 3074 or 3075 when e.Provider is "" || Providers.IsDirectoryService(e.Provider) => Ldap(e, file, pool),
+        (>= 8001 and <= 8004) or (>= 4001 and <= 4003) or 4013 or (>= 4020 and <= 4027) or (>= 4030 and <= 4033)
+            when e.Provider is "" || Providers.IsNtlm(e.Provider) => NtlmUse(e, file, pool),
         3000 when e.Provider is "" || e.Provider.Equals(Providers.SmbServer, StringComparison.OrdinalIgnoreCase) => Smb1(e, file, pool),
         _ => null,
     };
+
+    /// <summary>The well-known SID of anonymous sessions. Microsoft: ignore NTLM V1 in 4624 for ANONYMOUS LOGON.</summary>
+    public const string AnonymousSid = "S-1-5-7";
+
+    /// <summary>A successful TGT request without Kerberos pre-authentication (PreAuthType 0): the account can be AS-REP roasted.</summary>
+    internal static bool IsNoPreAuth(RawEvent e) =>
+        Clean(e["PreAuthType"]) == "0" && ParseEtype(e["Status"]) is null or 0;
+
+    /// <summary>True when an encryption type list ("AES256-SHA1, RC4", "0x12 0x17", "18 17 23") contains an AES type.</summary>
+    internal static bool HasAes(string list)
+    {
+        if (list.Contains("AES", StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var part in list.Split([' ', ',', ';'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (ParseEtype(part) is 0x11 or 0x12 or 0x13 or 0x14) return true;
+        }
+        return false;
+    }
+
+    /// <summary>"bob@LAB.LOCAL" becomes ("bob", "LAB.LOCAL"), so 4768, 4769 and 4624 group under the same account.</summary>
+    internal static (string Account, string Domain) SplitRealm(string account, string domain)
+    {
+        var at = account.LastIndexOf('@');
+        if (at <= 0 || at == account.Length - 1) return (account, domain);
+        return (account[..at], domain.Length > 0 ? domain : account[(at + 1)..]);
+    }
 
     /// <summary>Reason IDs of the enhanced NTLM events, from Microsoft's NTLM auditing overview.</summary>
     public static string NtlmReason(string id) => id.Trim() switch
@@ -95,7 +124,8 @@ public static class Classifier
         {
             4020 or 4021 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), First(e, "Hostname").Length > 0 ? First(e, "Hostname") : ShortHost(e.Computer),
                 First(e, "TargetService", "TargetMachine", "TargetIP"), With($"Outgoing {Ver("NTLM")}")),
-            4022 or 4023 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), CleanIp(First(e, "ClientIP", "RemoteClientMachine", "ClientNetworkName")),
+            // The machine name is preferred over the address, so the same client lines up with 4020 and 4030 to 4033.
+            4022 or 4023 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), CleanIp(First(e, "RemoteClientMachine", "ClientIP", "ClientNetworkName")),
                 "", $"Incoming {Ver("NTLM")}"),
             >= 4030 and <= 4033 => (Clean(e["AccountName"]), Clean(e["AccountDomain"]), Clean(e["AccountMachine"]), Clean(e["ServerName"]),
                 $"Checked by the domain controller, {Ver("NTLM")}"),
@@ -105,12 +135,22 @@ public static class Classifier
                 "NTLMv1-derived single sign-on credentials blocked"),
             8001 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
                 "Outgoing NTLM (audit 8001)"),
-            8002 => (Clean(e["ClientUserName"]), Clean(e["ClientDomainName"]), "", "", "Incoming NTLM (audit 8002)"),
+            // 8002 and 4002 name the local server process (often SYSTEM), not the remote user. The fix is on this server.
+            8002 => ("", "", "", ShortHost(e.Computer), "Incoming NTLM, client not logged (audit 8002)"),
+            4002 => ("", "", "", ShortHost(e.Computer), "Incoming NTLM blocked, client not logged (4002)"),
             8003 => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["Workstation"]), "", "Incoming NTLM with a domain account (audit 8003)"),
+            4003 => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["Workstation"]), "", "Incoming NTLM with a domain account blocked (4003)"),
+            4001 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
+                "Outgoing NTLM blocked (4001)"),
+            4013 => (First(e, "UserName", "ClientUserName"), First(e, "DomainName", "ClientDomainName"), ShortHost(e.Computer), Clean(e["TargetName"]),
+                "NTLMv1 attempt failed (4013)"),
+            4026 or 4027 => (First(e, "Username", "UserName"), Clean(e["DomainName"]), First(e, "Hostname").Length > 0 ? First(e, "Hostname") : ShortHost(e.Computer),
+                First(e, "TargetService", "TargetMachine", "TargetIP"),
+                With(e.EventId == 4026 ? $"Outgoing {Ver("NTLM")}, would be blocked (audit)" : $"Outgoing {Ver("NTLM")}, blocked by policy")),
             _ => (Clean(e["UserName"]), Clean(e["DomainName"]), Clean(e["WorkstationName"]), Clean(e["SChannelName"]), "NTLM checked by the domain controller (audit 8004)"),
         };
         if (downgrade && !weak) variant += ", security downgrade";
-        var kind = weak || e.EventId is 4024 or 4025 ? LegacyKind.Ntlmv1 : LegacyKind.Ntlm;
+        var kind = weak || e.EventId is 4024 or 4025 or 4013 ? LegacyKind.Ntlmv1 : LegacyKind.Ntlm;
         return Build(e, file, pool, kind, variant, account, domain, client, service, "", "",
             extra: [("Reason", reason), ("NTLM version", version)]);
     }
@@ -132,17 +172,46 @@ public static class Classifier
     private static bool IsEtypeFailure(RawEvent e) =>
         ParseEtype(e["Status"]) == EtypeNotSupported || ParseEtype(e["FailureCode"]) == EtypeNotSupported;
 
+    /// <summary>
+    /// Status 0xE. Domain controllers updated since January 2025 always log the client's offered types, so the side
+    /// to blame is the one without AES: the client's offer, the service account's keys (4769) or the account's keys.
+    /// </summary>
     private static AuthEvent SecurityEtypeFailure(RawEvent e, string file, StringPool pool)
     {
         var offered = Clean(e["ClientAdvertizedEncryptionTypes"]);
-        return Build(e, file, pool, LegacyKind.EtypeFailure,
-            offered.Length > 0 ? $"No common encryption type, client offered {offered}" : "No common encryption type (0xE)",
-            account: Clean(e["TargetUserName"]),
-            domain: Clean(e["TargetDomainName"]),
+        var serviceKeys = Clean(e["ServiceAvailableKeys"]);
+        var accountKeys = Clean(e["AccountAvailableKeys"]);
+        var variant = offered.Length > 0 && !HasAes(offered) ? $"No common encryption type, client offered {offered}"
+            : e.EventId == 4769 && serviceKeys.Length > 0 && !HasAes(serviceKeys) ? $"No common encryption type, service account has no AES keys ({serviceKeys})"
+            : accountKeys.Length > 0 && !HasAes(accountKeys) ? $"No common encryption type, account has no AES keys ({accountKeys})"
+            : "No common encryption type (0xE)";
+        var (account, domain) = SplitRealm(Clean(e["TargetUserName"]), Clean(e["TargetDomainName"]));
+        return Build(e, file, pool, LegacyKind.EtypeFailure, variant,
+            account: account,
+            domain: domain,
             client: CleanIp(e["IpAddress"]),
             service: Clean(e["ServiceName"]),
             ticket: "",
             session: "");
+    }
+
+    /// <summary>4768 with PreAuthType 0: a TGT was issued without pre-authentication (AS-REP roastable account).</summary>
+    private static AuthEvent NoPreAuth(RawEvent e, string file, StringPool pool)
+    {
+        var ticket = ParseEtype(e["TicketEncryptionType"]);
+        var (account, domain) = SplitRealm(Clean(e["TargetUserName"]), Clean(e["TargetDomainName"]));
+        return Build(e, file, pool, LegacyKind.NoPreAuth,
+            ticket is { } t ? $"TGT without pre-authentication, {EtypeName(t)}" : "TGT without pre-authentication",
+            account, domain, CleanIp(e["IpAddress"]), Clean(e["ServiceName"]), ticket is { } tt ? EtypeName(tt) : "", "");
+    }
+
+    /// <summary>4776: the domain controller validated NTLM credentials. Logged for every NTLM sign-in that reaches the DC.</summary>
+    private static AuthEvent NtlmValidation(RawEvent e, string file, StringPool pool)
+    {
+        var status = ParseEtype(e["Status"]);
+        return Build(e, file, pool, LegacyKind.Ntlm,
+            status is null or 0 ? "NTLM validated by the domain controller (4776)" : $"NTLM validation failed (4776, 0x{status:x})",
+            Clean(e["TargetUserName"]), "", Clean(e["Workstation"]), "", "", "");
     }
 
     /// <summary>
@@ -173,14 +242,23 @@ public static class Classifier
     /// </summary>
     private static AuthEvent Ldap(RawEvent e, string file, StringPool pool)
     {
-        if (e.EventId == 2887)
+        if (e.EventId is 2887 or 2888)
         {
             var simple = Clean(e.At(0));
             var sasl = Clean(e.At(1));
+            var what = e.EventId == 2888 ? "rejected" : "accepted";
             return Build(e, file, pool, LegacyKind.LdapSigning,
-                $"Daily summary: {Or(simple, "?")} simple binds without TLS, {Or(sasl, "?")} SASL binds without signing",
+                $"Daily summary: {Or(simple, "?")} simple binds without TLS, {Or(sasl, "?")} SASL binds without signing ({what})",
                 "", "", "all clients (daily summary)", "", "", "",
                 extra: [("Simple binds without TLS", simple), ("SASL binds without signing", sasl)]);
+        }
+        if (e.EventId == 3040)
+        {
+            var count = Clean(e.At(0));
+            return Build(e, file, pool, LegacyKind.LdapChannelBinding,
+                $"Daily summary: {Or(count, "?")} LDAPS binds without channel binding",
+                "", "", "all clients (daily summary)", "LDAPS", "", "",
+                extra: [("LDAPS binds without channel binding", count)]);
         }
 
         var client = LdapClient(e.At(0));
@@ -208,13 +286,13 @@ public static class Classifier
             extra: [("Client address", Clean(e.At(0)))]);
     }
 
-    /// <summary>"10.0.0.5:51234" becomes "10.0.0.5", "[fe80::1]:389" becomes "fe80::1".</summary>
+    /// <summary>"10.0.0.5:51234" becomes "10.0.0.5", "[fe80::1]:389" becomes "fe80::1". Loopback becomes "localhost" like elsewhere.</summary>
     internal static string LdapClient(string value)
     {
         value = Clean(value);
         var end = value.IndexOf(']');
-        if (value.StartsWith('[') && end > 0) return value[1..end];
-        return value.Count(c => c == ':') == 1 ? value[..value.IndexOf(':')] : value;
+        if (value.StartsWith('[') && end > 0) return CleanIp(value[1..end]);
+        return CleanIp(value.Count(c => c == ':') == 1 ? value[..value.IndexOf(':')] : value);
     }
 
     private static (string Account, string Domain) SplitIdentity(string identity)
@@ -241,13 +319,16 @@ public static class Classifier
         if (lm.Equals("NTLM V1", StringComparison.OrdinalIgnoreCase)) variant = "NTLM V1";
         else if (lm.Equals("LM", StringComparison.OrdinalIgnoreCase)) variant = "LM";
         else return null;
+        // Windows logs NTLM V1 for every anonymous session because it has no key material. Microsoft recommends ignoring them.
+        if (Clean(e["TargetUserSid"]) == AnonymousSid || Clean(e["TargetUserName"]).Equals("ANONYMOUS LOGON", StringComparison.OrdinalIgnoreCase)) return null;
 
+        // The machine name lines up with the NTLM Operational events (4020, 4022, 4030) of the same device. The address stays in the details.
         var ip = CleanIp(e["IpAddress"]);
         var workstation = Clean(e["WorkstationName"]);
         return Build(e, file, pool, LegacyKind.Ntlmv1, variant,
             account: Clean(e["TargetUserName"]),
             domain: Clean(e["TargetDomainName"]),
-            client: ip.Length > 0 ? ip : workstation,
+            client: workstation.Length > 0 ? workstation : ip,
             service: "",
             ticket: "",
             session: "");
@@ -257,16 +338,20 @@ public static class Classifier
     {
         var ticket = ParseEtype(e["TicketEncryptionType"]);
         var session = ParseEtype(e["SessionKeyEncryptionType"]);
-        var kind = Worst(ticket, session);
+        // 4768 since 2025: the type the account's own key used for pre-authentication.
+        var preAuth = e.EventId == 4768 ? ParseEtype(e["PreAuthEncryptionType"]) : null;
+        var kind = Worst(ticket, session, preAuth);
         if (kind is null) return null;
 
         var parts = new List<string>();
         if (ticket is { } t && KindOf(t) is not null) parts.Add($"Ticket {EtypeName(t)}");
         if (session is { } s && KindOf(s) is not null) parts.Add($"Session key {EtypeName(s)}");
+        if (preAuth is { } pa && KindOf(pa) is not null) parts.Add($"Pre-auth {EtypeName(pa)}");
 
+        var (account, domain) = SplitRealm(Clean(e["TargetUserName"]), Clean(e["TargetDomainName"]));
         return Build(e, file, pool, kind.Value, string.Join(", ", parts),
-            account: Clean(e["TargetUserName"]),
-            domain: Clean(e["TargetDomainName"]),
+            account: account,
+            domain: domain,
             client: CleanIp(e["IpAddress"]),
             service: Clean(e["ServiceName"]),
             ticket: ticket is { } tt ? EtypeName(tt) : "",
@@ -323,9 +408,9 @@ public static class Classifier
     }
 
     /// <summary>DES is worse than RC4, so DES wins when ticket and session key differ.</summary>
-    internal static LegacyKind? Worst(uint? ticket, uint? session)
+    internal static LegacyKind? Worst(params uint?[] etypes)
     {
-        var kinds = new[] { ticket, session }.Where(x => x is not null).Select(x => KindOf(x!.Value)).Where(k => k is not null).ToList();
+        var kinds = etypes.Where(x => x is not null).Select(x => KindOf(x!.Value)).Where(k => k is not null).ToList();
         if (kinds.Contains(LegacyKind.Des)) return LegacyKind.Des;
         if (kinds.Contains(LegacyKind.Rc4)) return LegacyKind.Rc4;
         return null;

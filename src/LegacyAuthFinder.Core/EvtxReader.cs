@@ -29,14 +29,14 @@ public static class Queries
 {
     public static readonly IReadOnlyList<string> NtlmFields =
     [
-        "TargetUserName", "TargetDomainName", "WorkstationName", "IpAddress", "IpPort", "LogonType",
+        "TargetUserName", "TargetDomainName", "TargetUserSid", "WorkstationName", "IpAddress", "IpPort", "LogonType",
         "LmPackageName", "AuthenticationPackageName", "KeyLength", "LogonProcessName", "ProcessName", "Status", "SubStatus",
     ];
 
     public static readonly IReadOnlyList<string> KerberosFields =
     [
         "TargetUserName", "TargetDomainName", "ServiceName", "IpAddress", "IpPort", "TicketOptions", "Status", "PreAuthType",
-        "TicketEncryptionType", "SessionKeyEncryptionType", "ClientAdvertizedEncryptionTypes",
+        "TicketEncryptionType", "SessionKeyEncryptionType", "PreAuthEncryptionType", "ClientAdvertizedEncryptionTypes",
         "AccountSupportedEncryptionTypes", "AccountAvailableKeys", "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
         "DCSupportedEncryptionTypes", "DCAvailableKeys",
     ];
@@ -49,9 +49,9 @@ public static class Queries
 
     private static IReadOnlySet<int> Range(int from, int to) => new HashSet<int>(Enumerable.Range(from, to - from + 1));
 
-    private static bool Weak(IRecordView v, string field) => Classifier.ParseEtype(v.Get(field)) is 0x17 or 0x18 or 0x1 or 0x3;
+    private static bool Weak(IRecordView v, string field) => v.Number(field) is 0x17 or 0x18 or 0x1 or 0x3;
 
-    private static bool Is0xE(IRecordView v, string field) => Classifier.ParseEtype(v.Get(field)) == Classifier.EtypeNotSupported;
+    private static bool Is0xE(IRecordView v, string field) => v.Number(field) == Classifier.EtypeNotSupported;
 
     public static EvtxQuery Ntlmv1 { get; } = new("NTLMv1 logons", Channels.Security,
         "*[System[(EventID=4624 or EventID=4625)] and EventData[Data[@Name='LmPackageName']='NTLM V1' or Data[@Name='LmPackageName']='LM']]",
@@ -63,9 +63,20 @@ public static class Queries
         {
             $"Data[@Name='TicketEncryptionType']='{t}'",
             $"Data[@Name='SessionKeyEncryptionType']='{t}'",
+            $"Data[@Name='PreAuthEncryptionType']='{t}'",
         }))
         + "]]",
-        KerberosFields, EventIds: Ids(4768, 4769, 4770), Filter: v => Weak(v, "TicketEncryptionType") || Weak(v, "SessionKeyEncryptionType"));
+        KerberosFields, EventIds: Ids(4768, 4769, 4770),
+        Filter: v => Weak(v, "TicketEncryptionType") || Weak(v, "SessionKeyEncryptionType") || (v.EventId == 4768 && Weak(v, "PreAuthEncryptionType")));
+
+    // A TGT issued without pre-authentication: the account has "Do not require Kerberos preauthentication" set.
+    public static EvtxQuery NoPreAuth { get; } = new("Accounts without Kerberos pre-authentication", Channels.Security,
+        "*[System[EventID=4768] and EventData[Data[@Name='PreAuthType']='0']]",
+        KerberosFields, EventIds: Ids(4768), Filter: v => v.Get("PreAuthType") == "0");
+
+    // Domain controllers log 4776 for every NTLM credential validation, also where the enhanced NTLM events do not exist yet.
+    public static EvtxQuery NtlmValidation { get; } = new("NTLM validation on domain controllers", Channels.Security,
+        "*[System[EventID=4776]]", ["TargetUserName", "Workstation", "Status", "PackageName"], EventIds: Ids(4776));
 
     public static EvtxQuery KdcWarnings { get; } = new("KDC RC4 warnings", Channels.System,
         $"*[System[(Provider[@Name='{Providers.KdcSvc}'] or Provider[@Name='{Providers.Kdc}']) and (EventID>=201 and EventID<=209)]]",
@@ -83,8 +94,8 @@ public static class Queries
 
     // Logged on domain controllers. 2889 needs the "16 LDAP Interface Events" diagnostic value set to 2.
     public static EvtxQuery Ldap { get; } = new("LDAP signing and channel binding", Channels.DirectoryService,
-        "*[System[(EventID=2887 or EventID=2889 or EventID=3039 or EventID=3074 or EventID=3075)]]",
-        null, Positional: true, EventIds: Ids(2887, 2889, 3039, 3074, 3075));
+        "*[System[(EventID=2887 or EventID=2888 or EventID=2889 or EventID=3039 or EventID=3040 or EventID=3074 or EventID=3075)]]",
+        null, Positional: true, EventIds: Ids(2887, 2888, 2889, 3039, 3040, 3074, 3075));
 
     // Field names taken from the provider manifests (Get-WinEvent -ListProvider). XPath compares names case-sensitively,
     // so both spellings Microsoft uses (Username in 4020 to 4023, UserName in 4024, 4025 and 8001 to 8004) are listed.
@@ -95,20 +106,24 @@ public static class Queries
         "Status", "StatusMsg", "TargetName", "ClientUserName", "ClientDomainName", "Workstation", "WorkstationName",
         "LogonType", "SChannelName", "SChannelType", "AccountName", "AccountDomain", "AccountMachine", "ServerName",
         "ServerDomain", "ServerIP", "ForwarderName", "ForwarderIP", "ChannelBindingStatus", "Mic Status", "DCName",
+        "NtlmBlockingReason",
     ];
 
     // Enhanced NTLM auditing (Windows 11 24H2, Windows Server 2025, Server 2019 and 2022 from the October 2026 updates):
     // 4020 to 4023 on clients and servers, 4030 to 4033 on domain controllers, 4024 and 4025 for NTLMv1-derived
-    // single sign-on. The older "Restrict NTLM" audit events 8001 to 8004 are read as well.
+    // single sign-on, 4026 and 4027 for NTLM that would be or was blocked. 4013 is a failed NTLMv1 attempt.
+    // The "Restrict NTLM" events are read as well: 8001 to 8004 in audit mode, 4001 to 4003 when blocking.
     public static EvtxQuery NtlmOperational { get; } = new("NTLM use", Channels.NtlmOperational,
-        "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4020 and EventID<=4025) or (EventID>=4030 and EventID<=4033))]]",
-        NtlmOperationalFields, EventIds: new HashSet<int>([.. Enumerable.Range(8001, 4), .. Enumerable.Range(4020, 6), .. Enumerable.Range(4030, 4)]));
+        "*[System[(EventID=8001 or EventID=8002 or EventID=8003 or EventID=8004 or (EventID>=4001 and EventID<=4003) or EventID=4013"
+        + " or (EventID>=4020 and EventID<=4027) or (EventID>=4030 and EventID<=4033))]]",
+        NtlmOperationalFields, EventIds: new HashSet<int>([.. Enumerable.Range(8001, 4), .. Enumerable.Range(4001, 3), 4013, .. Enumerable.Range(4020, 8), .. Enumerable.Range(4030, 4)]));
 
     // Logged only after Set-SmbServerConfiguration -AuditSmb1Access $true.
     public static EvtxQuery Smb1 { get; } = new("SMBv1 access", Channels.SmbServerAudit,
         "*[System[EventID=3000]]", ["ClientName"], EventIds: Ids(3000));
 
-    public static IReadOnlyList<EvtxQuery> All { get; } = [Ntlmv1, Kerberos, KerberosEtypeFailures, KdcWarnings, KdcEtypeErrors, Ldap, NtlmOperational, Smb1];
+    public static IReadOnlyList<EvtxQuery> All { get; } =
+        [Ntlmv1, Kerberos, KerberosEtypeFailures, NoPreAuth, NtlmValidation, KdcWarnings, KdcEtypeErrors, Ldap, NtlmOperational, Smb1];
 
     public static IEnumerable<EvtxQuery> For(string channel) => All.Where(q => q.Channel == channel);
 }
@@ -128,9 +143,10 @@ public sealed class WindowsEvtxReader : IEvtxReader
 
     public LogFileInfo Inspect(string path)
     {
-        var size = new FileInfo(path).Length;
+        long size = 0;
         try
         {
+            size = new FileInfo(path).Length;
             var clock = System.Diagnostics.Stopwatch.StartNew();
             var info = EventLogSession.GlobalSession.GetLogInformation(path, PathType.FilePath);
             var tInfo = clock.ElapsedMilliseconds;
@@ -143,7 +159,7 @@ public sealed class WindowsEvtxReader : IEvtxReader
         }
         catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException or IOException)
         {
-            Log?.Error("INSPECT", Path.GetFileName(path), ex);
+            Log?.Write("INSPECT", $"{Path.GetFileName(path)}: Windows API cannot read it: {ex.GetType().Name}: {ex.Message.Trim()}");
             return new LogFileInfo(path, size, "", "", 0, 0, null, null, $"Cannot read this file. It may be damaged or not an event log file. ({ex.Message.Trim()})");
         }
     }

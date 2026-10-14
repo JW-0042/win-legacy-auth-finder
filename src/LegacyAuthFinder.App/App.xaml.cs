@@ -10,12 +10,17 @@ public partial class App : Application
 {
     private Core.DiagLog? _log;
 
+    /// <summary>The list separator of the user's Windows region, captured before the app switches to English. Used for CSV.</summary>
+    public static char ListSeparator { get; private set; } = ',';
+
     // LegacyAuthFinder.exe [--demo | <folder>]
     // LegacyAuthFinder.exe --screenshot <file.png> [--theme light|dark] [--tab summary|events|files]
     // Screenshot mode loads the demo data, renders the main window to a PNG and exits. Used for the README.
     // It never touches real logs, so no real machine names, accounts or scripts can end up in public images.
     protected override async void OnStartup(StartupEventArgs e)
     {
+        var regional = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ListSeparator;
+        if (regional.Length == 1) ListSeparator = regional[0];
         // The interface is in English, so numbers and dates follow English formatting everywhere.
         System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
         System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
@@ -27,7 +32,13 @@ public partial class App : Application
             // One diagnostic log per session. Unhandled errors end up there too.
             var log = Core.DiagLog.Create("GUI");
             _log = log;
-            DispatcherUnhandledException += (_, ex) => log.Error("CRASH", "UI thread", ex.Exception);
+            DispatcherUnhandledException += (_, ex) =>
+            {
+                // Logged and shown, the app keeps running with its results.
+                log.Error("CRASH", "UI thread", ex.Exception);
+                ex.Handled = true;
+                MessageBox.Show(MainWindow, ex.Exception.Message, "Legacy Auth Finder", MessageBoxButton.OK, MessageBoxImage.Error);
+            };
             AppDomain.CurrentDomain.UnhandledException += (_, ex) => { if (ex.ExceptionObject is Exception x) log.Error("CRASH", "unhandled", x); };
             TaskScheduler.UnobservedTaskException += (_, ex) => log.Error("CRASH", "unobserved task", ex.Exception);
             var window = new MainWindow();
@@ -35,8 +46,16 @@ public partial class App : Application
             window.Show();
             var vmStart = (MainViewModel)window.DataContext;
             vmStart.AttachLog(log);
-            if (args.Contains("--demo")) await vmStart.LoadDemoAsync();
-            else if (args.Length > 0 && Directory.Exists(args[0])) await vmStart.OpenFolderAsync(args[0]);
+            try
+            {
+                if (args.Contains("--demo")) await vmStart.LoadDemoAsync();
+                else if (args.Length > 0 && Directory.Exists(args[0])) await vmStart.OpenFolderAsync(args[0]);
+            }
+            catch (Exception ex)
+            {
+                log.Error("UI", "Startup folder", ex);
+                MessageBox.Show(window, ex.Message, "Legacy Auth Finder", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
             return;
         }
 
@@ -75,9 +94,10 @@ public partial class App : Application
         var folderArg = Array.IndexOf(args, "--folder");
         if (folderArg >= 0 && folderArg + 1 < args.Length)
         {
+            await vm.OpenFolderAsync(args[folderArg + 1]);
+            // After opening: reading the folder sets the recommended number, the argument wins.
             var threadsArg = Array.IndexOf(args, "--threads");
             if (threadsArg >= 0 && threadsArg + 1 < args.Length && int.TryParse(args[threadsArg + 1], out var threads)) vm.Threads = threads;
-            await vm.OpenFolderAsync(args[folderArg + 1]);
             if (!args.Contains("--no-scan")) await vm.StartScanAsync();
         }
         else await vm.LoadDemoAsync();

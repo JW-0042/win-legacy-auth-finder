@@ -44,7 +44,7 @@ public class NtlmSmbTests
         var e = Classify(Ev(id, Providers.Ntlm, ("Username", "j.novak"), ("DomainName", "LAB"), ("ClientIP", "::ffff:10.0.30.7"),
             ("RemoteClientMachine", "LEGACY-XP01"), ("Hostname", "APP02"), ("NtlmVersion", version)));
         Assert.Equal(expected, e!.Kind);
-        if (id is 4022 or 4023) Assert.Equal("10.0.30.7", e.Client);
+        if (id is 4022 or 4023) Assert.Equal("LEGACY-XP01", e.Client);
     }
 
     [Fact]
@@ -91,8 +91,10 @@ public class NtlmSmbTests
         Assert.Equal(("bob", "PC7"), (e8003!.Account, e8003.Client));
         var e8001 = Classify(Ev(8001, Providers.Ntlm, ("TargetName", "fs01"), ("UserName", "bob")));
         Assert.Equal(("bob", "APP02", "fs01"), (e8001!.Account, e8001.Client, e8001.Service));
+        // 8002 names the local server process, not the remote user: no account, the server is the target.
         var e8002 = Classify(Ev(8002, Providers.Ntlm, ("ClientUserName", "SYSTEM"), ("ClientDomainName", "NT AUTHORITY")));
         Assert.Equal(LegacyKind.Ntlm, e8002!.Kind);
+        Assert.Equal(("", "", "APP02"), (e8002.Account, e8002.Client, e8002.Service));
     }
 
     [Fact]

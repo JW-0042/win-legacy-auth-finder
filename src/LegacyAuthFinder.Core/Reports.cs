@@ -16,48 +16,54 @@ public static class Reports
     /// <summary>Excel opens UTF-8 CSV correctly only with a byte order mark.</summary>
     public static readonly Encoding CsvEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
 
-    public static void WriteEventsCsv(TextWriter w, IEnumerable<AuthEvent> events)
+    /// <param name="separator">',' by default. Excel in many European locales expects ';' (the Windows list separator).</param>
+    public static void WriteEventsCsv(TextWriter w, IEnumerable<AuthEvent> events, char separator = ',')
     {
-        w.WriteLine("Time,Type,Detail,Computer,EventId,Event,Account,Domain,Client,Service,TicketEncryption,SessionKeyEncryption,File,RecordId");
+        string C(string v) => Csv(v, separator);
+        w.WriteLine(string.Join(separator, "Time", "Type", "Detail", "Computer", "EventId", "Event", "Account", "Domain", "Client", "Service",
+            "TicketEncryption", "SessionKeyEncryption", "File", "RecordId"));
         foreach (var e in events)
         {
-            w.WriteLine(string.Join(',',
-                e.Time.ToString(TimeFormat, CultureInfo.InvariantCulture), e.KindLabel, Csv(e.Variant), Csv(e.Computer),
-                e.EventId.ToString(CultureInfo.InvariantCulture), Csv(e.What), Csv(e.Account), Csv(e.Domain), Csv(e.Client),
-                Csv(e.Service), Csv(e.TicketEncryption), Csv(e.SessionEncryption), Csv(e.File), e.RecordId.ToString(CultureInfo.InvariantCulture)));
+            w.WriteLine(string.Join(separator,
+                e.Time.ToString(TimeFormat, CultureInfo.InvariantCulture), e.KindLabel, C(e.Variant), C(e.Computer),
+                e.EventId.ToString(CultureInfo.InvariantCulture), C(e.What), C(e.Account), C(e.Domain), C(e.Client),
+                C(e.Service), C(e.TicketEncryption), C(e.SessionEncryption), C(e.File), e.RecordId.ToString(CultureInfo.InvariantCulture)));
         }
     }
 
-    public static void WriteSummaryCsv(TextWriter w, IEnumerable<SummaryRow> rows)
+    public static void WriteSummaryCsv(TextWriter w, IEnumerable<SummaryRow> rows, char separator = ',')
     {
-        w.WriteLine("Type,Account,Client,Service,Count,FirstSeen,LastSeen,Computers,Details");
+        string C(string v) => Csv(v, separator);
+        w.WriteLine(string.Join(separator, "Type", "Account", "Client", "Service", "Count", "FirstSeen", "LastSeen", "Computers", "Details"));
         foreach (var r in rows)
         {
-            w.WriteLine(string.Join(',',
-                r.KindLabel, Csv(r.Account), Csv(r.Client), Csv(r.Service), r.Count.ToString(CultureInfo.InvariantCulture),
+            w.WriteLine(string.Join(separator,
+                r.KindLabel, C(r.Account), C(r.Client), C(r.Service), r.Count.ToString(CultureInfo.InvariantCulture),
                 r.FirstSeen.ToString(TimeFormat, CultureInfo.InvariantCulture), r.LastSeen.ToString(TimeFormat, CultureInfo.InvariantCulture),
-                Csv(r.ComputersText), Csv(r.VariantsText)));
+                C(r.ComputersText), C(r.VariantsText)));
         }
     }
 
-    public static void WriteFixesCsv(TextWriter w, IEnumerable<FixItem> items)
+    public static void WriteFixesCsv(TextWriter w, IEnumerable<FixItem> items, char separator = ',')
     {
-        w.WriteLine("Rank,Type,FixOn,Target,Problem,Action,Events,FirstSeen,LastSeen,Accounts,Clients,Services,LoggedOn");
+        string C(string v) => Csv(v, separator);
+        w.WriteLine(string.Join(separator, "Rank", "Type", "FixOn", "Target", "Problem", "Action", "Events", "FirstSeen", "LastSeen",
+            "Accounts", "Clients", "Services", "LoggedOn"));
         foreach (var f in items)
         {
-            w.WriteLine(string.Join(',',
-                f.Rank.ToString(CultureInfo.InvariantCulture), f.KindLabel, Csv(f.TargetTypeText), Csv(f.Target), Csv(f.Problem), Csv(f.Action),
+            w.WriteLine(string.Join(separator,
+                f.Rank.ToString(CultureInfo.InvariantCulture), f.KindLabel, C(f.TargetTypeText), C(f.Target), C(f.Problem), C(f.Action),
                 f.Events.ToString(CultureInfo.InvariantCulture), f.FirstSeen.ToString(TimeFormat, CultureInfo.InvariantCulture),
-                f.LastSeen.ToString(TimeFormat, CultureInfo.InvariantCulture), Csv(string.Join(" ", f.Accounts)), Csv(string.Join(" ", f.Clients)),
-                Csv(string.Join(" ", f.Services)), Csv(string.Join(" ", f.Computers))));
+                f.LastSeen.ToString(TimeFormat, CultureInfo.InvariantCulture), C(string.Join(" ", f.Accounts)), C(string.Join(" ", f.Clients)),
+                C(string.Join(" ", f.Services)), C(string.Join(" ", f.Computers))));
         }
     }
 
     /// <summary>Quotes a CSV field when needed and defuses values that spreadsheet apps would run as formulas.</summary>
-    public static string Csv(string value)
+    public static string Csv(string value, char separator = ',')
     {
         if (value.Length > 0 && value[0] is '=' or '+' or '-' or '@' or '\t' or '\r') value = "'" + value;
-        return value.IndexOfAny([',', '"', '\n', '\r']) >= 0 ? $"\"{value.Replace("\"", "\"\"")}\"" : value;
+        return value.IndexOfAny([separator, ',', ';', '"', '\n', '\r']) >= 0 ? $"\"{value.Replace("\"", "\"\"")}\"" : value;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -66,13 +72,23 @@ public static class Reports
         Converters = { new JsonStringEnumConverter() },
     };
 
-    public static string ToJson(ScanResult r) => JsonSerializer.Serialize(new
+    public static string ToJson(ScanResult r) => JsonSerializer.Serialize(JsonModel(r), JsonOptions);
+
+    /// <summary>Streams the JSON report to a file instead of building one big string.</summary>
+    public static void WriteJson(Stream stream, ScanResult r) => JsonSerializer.Serialize(stream, JsonModel(r), JsonOptions);
+
+    public static string Version => typeof(Reports).Assembly.GetName().Version?.ToString(3) ?? "?";
+
+    private static object JsonModel(ScanResult r) => new
     {
         tool = "Legacy Auth Finder",
-        version = typeof(Reports).Assembly.GetName().Version?.ToString(3),
+        version = Version,
         scope = r.Scope,
         durationSeconds = Math.Round(r.Duration.TotalSeconds, 1),
         cancelled = r.Cancelled,
+        incomplete = r.Incomplete,
+        failedFiles = r.FailedFiles,
+        duplicatesSkipped = r.Duplicates,
         totals = new
         {
             ntlmv1 = r.Count(LegacyKind.Ntlmv1),
@@ -83,6 +99,7 @@ public static class Reports
             etypeErrors = r.Count(LegacyKind.EtypeFailure),
             smb1 = r.Count(LegacyKind.Smb1),
             ntlm = r.Count(LegacyKind.Ntlm),
+            noPreAuth = r.Count(LegacyKind.NoPreAuth),
             all = r.TotalHits,
         },
         files = r.Files.Select(f => new
@@ -123,10 +140,10 @@ public static class Reports
             count = s.Count,
             firstSeen = s.FirstSeen,
             lastSeen = s.LastSeen,
-            computers = s.Computers,
-            details = s.Variants,
+            computers = s.Computers.Order(StringComparer.OrdinalIgnoreCase),
+            details = s.Variants.Order(StringComparer.Ordinal),
         }),
-    }, JsonOptions);
+    };
 
     public static string ToHtml(ScanResult r)
     {
@@ -138,8 +155,10 @@ public static class Reports
         sb.Append("h1{margin:0 0 4px}.meta{color:#5b6470;margin:0 0 24px}.tiles{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}");
         sb.Append(".tile{background:#fff;border:1px solid #e1e4e8;border-radius:10px;padding:12px 16px;min-width:130px}.tile b{display:block;font-size:24px}");
         sb.Append("table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e1e4e8;margin-bottom:24px;font-size:13px}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid #eef0f2;vertical-align:top}");
-        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.Des{color:#b0124f}.Ntlmv1{color:#d93025}.Rc4{color:#c25e00}.LdapSigning{color:#7c3aed}.LdapChannelBinding{color:#0e7490}.EtypeFailure{color:#2f6fd6}.Smb1{color:#9a3412}.Ntlm{color:#4b5b6e}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
-        sb.Append($"<h1>Legacy authentication report</h1><p class=\"meta\">{E(r.Scope)} · {r.Files.Count} files · {r.Duration.TotalMinutes:0.#} minutes{(r.Cancelled ? " · scan was cancelled, results are incomplete" : "")}</p>");
+        sb.Append("th{background:#f1f3f5}.k{font-weight:600}.Des{color:#b0124f}.Ntlmv1{color:#d93025}.Rc4{color:#c25e00}.LdapSigning{color:#7c3aed}.LdapChannelBinding{color:#0e7490}.EtypeFailure{color:#2f6fd6}.Smb1{color:#9a3412}.Ntlm{color:#4b5b6e}.NoPreAuth{color:#a21caf}.Rc4{color:#a84f00}.g{background:#fff;border:1px solid #e1e4e8;border-radius:8px;padding:12px 16px;margin-bottom:12px}a{color:#0b62c4}</style></head><body><div class=\"wrap\">");
+        sb.Append($"<h1>Legacy authentication report</h1><p class=\"meta\">{E(r.Scope)} · {r.Files.Count} files · {r.Duration.TotalMinutes:0.#} minutes · Legacy Auth Finder {Version}"
+            + $"{(r.Cancelled ? " · scan was cancelled, results are incomplete" : "")}{(r.FailedFiles > 0 ? $" · {r.FailedFiles} {(r.FailedFiles == 1 ? "file" : "files")} had read errors" : "")}"
+            + $"{(r.Duplicates > 0 ? $" · {r.Duplicates:N0} duplicate records from overlapping files counted once" : "")}</p>");
         sb.Append("<div class=\"tiles\">");
         foreach (var kind in Guidance.Order)
         {

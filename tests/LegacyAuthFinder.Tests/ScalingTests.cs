@@ -5,6 +5,8 @@ using Xunit.Abstractions;
 namespace LegacyAuthFinder.Tests;
 
 /// <summary>Many files with many hits, scanned with few and many threads. Guards against lock contention.</summary>
+/// <remarks>Timing test: runs alone, so other test classes do not share the CPU with it.</remarks>
+[Collection(SerialCollection.Name)]
 public sealed class ScalingTests(ITestOutputHelper output)
 {
     private sealed class BusyReader(int eventsPerFile) : IEvtxReader
@@ -55,6 +57,8 @@ public sealed class ScalingTests(ITestOutputHelper output)
         var two = Run(2);
         var sixteen = Run(16);
         output.WriteLine($"{files} files x {perFile:N0} events: 2 threads {two:0.00} s, 16 threads {sixteen:0.00} s, memory {GC.GetTotalMemory(false) / 1048576} MB");
-        Assert.True(sixteen <= two * 1.5, $"16 threads took {sixteen:0.00} s, 2 threads {two:0.00} s");
+        // On small CI runners 16 threads share 2 to 4 cores, so only a clear slowdown counts as lock contention.
+        var allowed = Environment.ProcessorCount >= 8 ? 1.5 : 2.5;
+        Assert.True(sixteen <= two * allowed, $"16 threads took {sixteen:0.00} s, 2 threads {two:0.00} s"); 
     }
 }

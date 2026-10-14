@@ -16,10 +16,15 @@ public sealed class DiagLog : IDisposable
 {
     public const int KeepFiles = 20;
 
+    /// <summary>A log never grows past this. Thousands of damaged files would otherwise write a stack trace each.</summary>
+    public const long MaxBytes = 200L << 20;
+
     private readonly Lock _gate = new();
     private readonly StreamWriter? _writer;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private bool _disposed;
+    private long _written;
+    private bool _full;
 
     private DiagLog(string path, StreamWriter? writer)
     {
@@ -65,9 +70,15 @@ public sealed class DiagLog : IDisposable
         var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} +{_clock.Elapsed.TotalSeconds,8:0.000}s T{Environment.CurrentManagedThreadId,-3} {area,-8} {message}";
         lock (_gate)
         {
-            if (_disposed) return;
+            if (_disposed || _full) return;
             try
             {
+                _written += line.Length + 2;
+                if (_written > MaxBytes)
+                {
+                    _full = true;
+                    line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} LIMIT    The log reached {MaxBytes >> 20} MB. Nothing more is written.";
+                }
                 _writer.WriteLine(line);
             }
             catch (IOException)
@@ -86,7 +97,14 @@ public sealed class DiagLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            _writer?.Dispose();
+            try
+            {
+                _writer?.Dispose();
+            }
+            catch (IOException)
+            {
+                // The last flush can fail on a full disk. The log is best effort.
+            }
         }
     }
 
@@ -124,7 +142,16 @@ public sealed class DiagLog : IDisposable
             foreach (var old in new DirectoryInfo(dir).GetFiles("legacy-auth-finder-*.log")
                          .OrderByDescending(f => f.LastWriteTimeUtc).Skip(KeepFiles - 1))
             {
-                old.Delete();
+                // A log that another running instance still writes is skipped: opening it exclusively fails.
+                try
+                {
+                    using (new FileStream(old.FullName, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                    old.Delete();
+                }
+                catch (IOException)
+                {
+                    // In use.
+                }
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

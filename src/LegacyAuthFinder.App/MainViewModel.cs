@@ -80,6 +80,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private Action? _onTick;
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _searchCts;
+    private bool _inventoryStale;
+    private string _notice = "";
     private ScanResult? _result;
     private string _folder = "";
     private bool _recurse = true;
@@ -159,8 +161,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             _recurse = value;
             OnChanged();
-            // The file list depends on it, so read the folder again.
-            if (HasFolder && !_isDemo && !_isBusy) _ = OpenFolderAsync(_folder);
+            if (!HasFolder || _isDemo || _isBusy) return;
+            if (_result is not null)
+            {
+                // Results stay until the next scan, which reads the folder again first.
+                _inventoryStale = true;
+                Notice = "The subfolder setting applies to the next scan. The results shown are from the last one.";
+                return;
+            }
+            // No results yet: read the file list again right away. Errors are shown, not thrown into nowhere.
+            _ = ReloadFolderAsync();
         }
     }
 
@@ -187,8 +197,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public bool CanAct => !_isBusy;
     public int RelevantCount => _inventory.Count(f => f.IsRelevant);
     public bool CanScan => !_isBusy && !_isDemo && RelevantCount > 0;
-    public string ScanButtonText => _result is null || _isDemo ? "Start scan" : "Scan again";
+    public string ScanButtonText => _result is null || _isDemo ? "_Start scan" : "_Scan again";
     public string StatusText { get => _statusText; private set { _statusText = value; OnChanged(); } }
+
+    /// <summary>A note under the totals: a setting that applies later, a folder that could not be read.</summary>
+    public string Notice { get => _notice; private set { _notice = value; OnChanged(); OnChanged(nameof(HasNotice)); } }
+    public bool HasNotice => _notice.Length > 0;
+
+    public string VersionText => $"Version {Reports.Version}";
+    public string WindowTitle => $"Legacy Auth Finder {Reports.Version}";
     public double OverallProgress { get => _overall; private set { _overall = value; OnChanged(); } }
 
     public ScanResult? Result
@@ -223,15 +240,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
         null when HasFolder => "No Security, System, Directory Service, NTLM or SMB audit logs in this folder.",
         null => "Open a folder with archived .evtx files from your servers. The tool works out which log each file is, then you start the scan.",
         { Cancelled: true } => $"Scan cancelled. {_result.TotalHits:N0} events found so far.",
+        { FailedFiles: > 0 } => $"{_result.TotalHits:N0} events found, but {_result.FailedFiles} {(_result.FailedFiles == 1 ? "file" : "files")} had read errors. See the Files tab.",
         { TotalHits: 0 } => _result.Files.Count(f => f.IsRelevant) is var n && n == 1
             ? "Nothing found in 1 log."
             : $"Nothing found in {_result.Files.Count(f => f.IsRelevant)} logs.",
         _ => $"{_result.TotalHits:N0} events from {_result.Summary.Count:N0} account and client pairs, scanned in {(_result.Duration.TotalSeconds < 10 ? _result.Duration.TotalSeconds.ToString("0.#") : _result.Duration.TotalSeconds.ToString("0"))} s",
     };
-    public bool IsTruncated => _result?.Truncated == true;
+    public bool IsTruncated => TruncatedText.Length > 0;
     public string TruncatedText => _result is { Truncated: true }
-        ? $"The event list shows the first {Scanner.DefaultMaxEvents:N0} events. The summary and the totals include all of them."
-        : "";
+        ? $"The event list keeps the newest {_result.Events.Count:N0} events. The summary, the fix list and the totals include all of them."
+          + (_result.Duplicates > 0 ? $" {_result.Duplicates:N0} records from overlapping files were counted once." : "")
+        : _result is { Duplicates: > 0 } ? $"{_result.Duplicates:N0} records from overlapping files were counted once." : "";
 
     public string KindFilter { get => _kindFilter; set { _kindFilter = value; OnChanged(); _ = ApplyFilterAsync(); } }
     public string Search { get => _search; set { _search = value; OnChanged(); _searchTimer.Stop(); _searchTimer.Start(); } }
@@ -298,8 +317,28 @@ public sealed class MainViewModel : INotifyPropertyChanged
         rows.Where(r => r.Value.Length > 0).Select(r => new DetailRow(r.Label, r.Value));
 
     /// <summary>Reads the folder and works out which log each file is. Scanning starts only with <see cref="StartScanAsync"/>.</summary>
-    public async Task OpenFolderAsync(string folder)
+    public async Task OpenFolderAsync(string folder) => await OpenFolderAsync(folder, keepThreads: false);
+
+    private async Task ReloadFolderAsync()
     {
+        try
+        {
+            await OpenFolderAsync(_folder, keepThreads: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            _log?.Error("UI", "Reading the folder again failed", ex);
+            Notice = $"The folder could not be read: {ex.Message}";
+        }
+    }
+
+    /// <param name="keepThreads">Keep the user's choice of files at once when the same folder is read again.</param>
+    private async Task OpenFolderAsync(string folder, bool keepThreads)
+    {
+        _searchCts?.Cancel();
+        keepThreads &= string.Equals(folder, _folder, StringComparison.OrdinalIgnoreCase);
+        Notice = "";
+        _inventoryStale = false;
         Folder = folder;
         _isDemo = false;
         _scanCts = new CancellationTokenSource();
@@ -326,7 +365,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 var explain = await Task.Run(() => Storage.Explain(folder), token);
                 _log.Write("FOLDER", $"Storage {_storage}: {explain}. Recommended {_recommended} files at once.");
             }
-            Threads = ThreadChoices.Contains(_recommended) ? _recommended : 4;
+            if (!keepThreads) Threads = ThreadChoices.Contains(_recommended) ? _recommended : 4;
             var recurse = Recurse;
             var parallel = Math.Max(4, Threads);
             var log = _log;
@@ -357,6 +396,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public async Task StartScanAsync()
     {
         if (!CanScan) return;
+        _searchCts?.Cancel();
+        if (_inventoryStale) await OpenFolderAsync(_folder, keepThreads: true);
+        if (!CanScan) return;
+        Notice = "";
         var folder = Folder;
         _scanCts = new CancellationTokenSource();
         var token = _scanCts.Token;
@@ -438,6 +481,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             _clock.Stop();
             _onTick = null;
+            IsBusy = false;
+            StatusText = "";
+        }
+    }
+
+    /// <summary>Runs a long task (an export) with the busy state, so the window stays responsive and nothing else starts.</summary>
+    public async Task RunBusyAsync(string status, Func<Task> work)
+    {
+        IsBusy = true;
+        StatusText = status;
+        try
+        {
+            await work();
+        }
+        finally
+        {
             IsBusy = false;
             StatusText = "";
         }
@@ -556,7 +615,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 var fx = source.Fixes.Where(f => (kind is null || f.Kind == kind) && (terms.Length == 0 || f.Matches(terms))).ToList();
                 return (ev, sm, fx);
             }, cts.Token);
-            if (cts.IsCancellationRequested) return;
+            // A newer search or a new scan replaced this result in the meantime.
+            if (cts.IsCancellationRequested || !ReferenceEquals(source, _result)) return;
             Events = events;
             Summary = summary;
             Fixes = fixes;

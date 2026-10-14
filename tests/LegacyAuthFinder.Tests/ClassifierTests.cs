@@ -22,8 +22,9 @@ public class ClassifierTests
         Assert.NotNull(e);
         Assert.Equal(LegacyKind.Ntlmv1, e.Kind);
         Assert.Equal(variant, e.Variant);
-        Assert.Equal("10.0.0.5", e.Client);
+        Assert.Equal("OLDPC", e.Client);
         Assert.Equal("alice", e.Account);
+        Assert.Contains(e.Fields, f => f.Key == "IpAddress" && f.Value == "::ffff:10.0.0.5");
         Assert.Contains(e.Fields, f => f.Key == "WorkstationName" && f.Value == "OLDPC");
     }
 

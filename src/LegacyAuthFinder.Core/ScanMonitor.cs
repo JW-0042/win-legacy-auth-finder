@@ -32,6 +32,14 @@ internal sealed class FileWork(LogFileInfo file, int order)
     public TimeSpan InPhase => Stopwatch.GetElapsedTime(Interlocked.Read(ref _phaseSince));
     public TimeSpan SinceLife => Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastLife));
 
+    /// <summary>The file starts now: the time it waited in the queue is not a gap.</summary>
+    public void Start()
+    {
+        Interlocked.Exchange(ref _lastLife, Stopwatch.GetTimestamp());
+        LongestGapTicks = 0;
+        Enter("starting");
+    }
+
     public void Enter(string phase)
     {
         Volatile.Write(ref _phase, phase);
@@ -61,6 +69,7 @@ internal sealed class ScanMonitor : IDisposable
     private SystemProbe.ProcessSample? _self = SystemProbe.Self();
     private SystemProbe.ProcessSample? _service = SystemProbe.EventLogService();
     private int _ticks;
+    private volatile bool _disposed;
 
     public ScanMonitor(DiagLog log, ConcurrentDictionary<string, FileWork> work, TimeSpan interval, TimeSpan stallAfter)
     {
@@ -72,9 +81,30 @@ internal sealed class ScanMonitor : IDisposable
 
     public int Stalls { get; private set; }
 
+    /// <summary>The last heartbeat when the scan ends. Waits for a running tick instead of skipping.</summary>
+    public void FinalTick()
+    {
+        lock (_tickGate)
+        {
+            TickCore();
+        }
+    }
+
     public void Tick()
     {
-        if (!_tickGate.TryEnter()) return;
+        if (_disposed || !_tickGate.TryEnter()) return;
+        try
+        {
+            TickCore();
+        }
+        finally
+        {
+            _tickGate.Exit();
+        }
+    }
+
+    private void TickCore()
+    {
         try
         {
             _ticks++;
@@ -110,18 +140,17 @@ internal sealed class ScanMonitor : IDisposable
         {
             _log.Error("BEAT", "heartbeat failed", ex);
         }
-        finally
-        {
-            _tickGate.Exit();
-        }
     }
 
     public static string Seconds(TimeSpan t) => t.TotalSeconds < 100 ? $"{t.TotalSeconds:0.0} s" : $"{t:hh\\:mm\\:ss}";
 
+    /// <summary>
+    /// Stops the timer. A tick that is still running finishes on its own and sees the flag. No wait handle is used: one
+    /// disposed after a timeout would be signalled later by the runtime and crash the process.
+    /// </summary>
     public void Dispose()
     {
-        using var done = new ManualResetEvent(false);
-        _timer.Dispose(done);
-        done.WaitOne(TimeSpan.FromSeconds(5));
+        _disposed = true;
+        _timer.Dispose();
     }
 }

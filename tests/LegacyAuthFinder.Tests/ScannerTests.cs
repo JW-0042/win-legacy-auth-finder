@@ -28,12 +28,15 @@ public class ScannerTests
     private static LogFileInfo File(string path, string channel, string? error = null) =>
         new(path, 1000, channel, "SRV", 100, 1, null, null, error);
 
-    private static RawEvent Rc4(string user, string client, int minute, long record = 1) =>
-        new(4769, Providers.SecurityAuditing, new DateTime(2026, 9, 1, 10, minute, 0), "DC01", record,
+    private static long _record;
+
+    // Every event gets its own record ID, like in a real log. Equal IDs in one file count as one record.
+    private static RawEvent Rc4(string user, string client, int minute, long record = 0) =>
+        new(4769, Providers.SecurityAuditing, new DateTime(2026, 9, 1, 10, minute, 0), "DC01", record > 0 ? record : Interlocked.Increment(ref _record),
             new Dictionary<string, string> { ["TicketEncryptionType"] = "0x17", ["TargetUserName"] = user, ["IpAddress"] = client, ["ServiceName"] = "HTTP/app" });
 
     private static RawEvent Ntlm(string user, int minute) =>
-        new(4624, Providers.SecurityAuditing, new DateTime(2026, 9, 1, 9, minute, 0), "FS01", 1,
+        new(4624, Providers.SecurityAuditing, new DateTime(2026, 9, 1, 9, minute, 0), "FS01", Interlocked.Increment(ref _record),
             new Dictionary<string, string> { ["LmPackageName"] = "NTLM V1", ["TargetUserName"] = user, ["IpAddress"] = "10.0.0.7" });
 
     [Fact]
@@ -48,7 +51,8 @@ public class ScannerTests
         var r = Scanner.Scan(reader, files, "test", new ScanOptions());
         Assert.Equal(FileState.Skipped, r.FileResults["c.evtx"].State);
         Assert.Equal(FileState.Error, r.FileResults["d.evtx"].State);
-        Assert.Equal(["NTLMv1 logons", "RC4 and DES Kerberos tickets", "Kerberos encryption type failures"],
+        Assert.Equal(["NTLMv1 logons", "RC4 and DES Kerberos tickets", "Kerberos encryption type failures", "Accounts without Kerberos pre-authentication",
+                "NTLM validation on domain controllers"],
             reader.Calls.Where(c => c.Path == "a.evtx").Select(c => c.Query));
         Assert.Equal(["KDC RC4 warnings", "KDC encryption type errors"], reader.Calls.Where(c => c.Path == "b.evtx").Select(c => c.Query));
         Assert.Equal(["LDAP signing and channel binding"], reader.Calls.Where(c => c.Path == "e.evtx").Select(c => c.Query));

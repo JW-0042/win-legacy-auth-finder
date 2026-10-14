@@ -48,6 +48,8 @@ public sealed class EvtxParserTests(ITestOutputHelper output) : IDisposable
         var selectors = new Dictionary<string, EventLogPropertySelector>();
         var mismatches = new List<string>();
         var compared = 0;
+        // The XML rendering is slow, so the XML-style values (used for KDC warnings) are compared on fewer records.
+        const int XmlLimit = 4_000;
         using var reader = new EventLogReader(new EventLogQuery(path, PathType.FilePath, "*"));
         while (compared < Limit && reader.ReadEvent() is EventLogRecord w)
         {
@@ -88,11 +90,27 @@ public sealed class EvtxParserTests(ITestOutputHelper output) : IDisposable
                 var values = w.GetPropertyValues(selector);
                 for (var i = 0; i < names.Count; i++) Check($"field {names[i]}", WindowsEvtxReader.Format(names[i], values[i]), r.Named[names[i]]);
             }
+            if (compared <= XmlLimit)
+            {
+                var (xmlData, xmlValues) = WindowsEvtxReader.EventDataFromXml(w.ToXml());
+                Check("xml value count", xmlValues.Count, r.Xml.Values.Count);
+                for (var i = 0; i < Math.Min(xmlValues.Count, r.Xml.Values.Count); i++) Check($"xml value {i}", xmlValues[i], r.Xml.Values[i]);
+                foreach (var (k, v) in xmlData) Check($"xml field {k}", v, r.Xml.Data.GetValueOrDefault(k));
+            }
             if (mismatches.Count > 200) break;
         }
         foreach (var s in selectors.Values) s.Dispose();
         output.WriteLine($"{log}: compared {compared:N0} records, {mismatches.Count} differences");
-        foreach (var m in mismatches.Take(30)) output.WriteLine("  " + m);
+        // Group by kind of difference, so one run shows every distinct problem.
+        foreach (var g in mismatches.GroupBy(m =>
+                 {
+                     var rest = System.Text.RegularExpressions.Regex.Replace(m, @"^record \d+ ", "");
+                     return rest[..Math.Min(60, rest.Length)];
+                 }).Take(25))
+        {
+            var m = g.First();
+            output.WriteLine($"  {g.Count()}x {(m.Length > 400 ? m[..400] : m).Replace("\r", "\\r").Replace("\n", "\\n")}");
+        }
         Assert.Empty(mismatches);
     }
 

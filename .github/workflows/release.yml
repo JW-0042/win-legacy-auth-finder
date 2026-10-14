@@ -5,19 +5,42 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release:
+  # Tests run without any write permission. Only the job that publishes gets them.
+  test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
+      - name: The tag must match the version in Directory.Build.props
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = ([xml](Get-Content Directory.Build.props)).Project.PropertyGroup.Version
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match version $version in Directory.Build.props" }
       - run: dotnet test LegacyAuthFinder.slnx -c Release
+
+  release:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 10.0.x
       - name: Publish self-contained single-file builds
         shell: pwsh
         run: |
@@ -28,12 +51,14 @@ jobs:
           Copy-Item publish/app/LegacyAuthFinder.exe, publish/cli/legacy-auth-scan.exe, LICENSE, README.md -Destination dist
           Compress-Archive dist/* LegacyAuthFinder-win-x64.zip
           (Get-FileHash LegacyAuthFinder-win-x64.zip -Algorithm SHA256).Hash.ToLower() + "  LegacyAuthFinder-win-x64.zip" | Out-File -Encoding ascii SHA256SUMS.txt
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             LegacyAuthFinder-win-x64.zip
             dist/*.exe
       - name: Create GitHub release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} LegacyAuthFinder-win-x64.zip SHA256SUMS.txt --title "Legacy Auth Finder ${{ github.ref_name }}" --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: gh release create $env:TAG LegacyAuthFinder-win-x64.zip SHA256SUMS.txt --title "Legacy Auth Finder $env:TAG" --generate-notes
