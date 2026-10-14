@@ -3,7 +3,7 @@ using LegacyAuthFinder.Core;
 // legacy-auth-scan <folder> [--no-recurse] [--threads n] [--events-csv f] [--summary-csv f] [--fix-csv f] [--json f] [--html f]
 //                  [--csv-separator c] [--log f | --no-log] [--windows-api] [--quiet]
 // Exit codes: 0 = nothing found, 1 = legacy authentication found, 2 = invalid arguments, 3 = no readable log files,
-//             4 = incomplete (cancelled, or files with read errors), 5 = an export could not be written.
+//             4 = nothing found but incomplete (cancelled, or files with read errors), 5 = an export could not be written.
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
@@ -55,7 +55,7 @@ for (var i = 0; i < args.Length; i++)
             Console.WriteLine("Every .evtx file in the folder is checked. Security, System, Directory Service, NTLM Operational and SMBServer Audit logs are scanned, other logs are skipped.");
             Console.WriteLine($"A diagnostic log (timings, no event content) is written to {DiagLog.DefaultFolder} unless --no-log is given.");
             Console.WriteLine("Exit codes: 0 nothing found, 1 legacy authentication found, 2 invalid arguments, 3 no readable log files,");
-            Console.WriteLine("            4 incomplete (cancelled, or files with read errors), 5 an export could not be written.");
+            Console.WriteLine("            4 nothing found but incomplete (cancelled, or files with read errors), 5 an export could not be written.");
             return 0;
         default:
             if (folder is null && !args[i].StartsWith('-')) { folder = args[i]; break; }
@@ -196,8 +196,9 @@ Export(jsonPath, p =>
 Export(htmlPath, p => File.WriteAllText(p, Reports.ToHtml(result)));
 
 if (exportFailed) return ExportFailed;
-if (result.Incomplete) return Incomplete;
-return result.TotalHits > 0 ? 1 : 0;
+// Findings win over incomplete: a script must not miss them. Incomplete only replaces "nothing found".
+if (result.TotalHits > 0) return 1;
+return result.Incomplete ? Incomplete : 0;
 
 // The folder must exist and accept a new file.
 static string? CheckWritable(string path)

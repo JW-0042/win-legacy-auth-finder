@@ -116,7 +116,7 @@ The command line writes the same diagnostic log as the app, to the default folde
 | 1 | Legacy authentication found (any type, NTLM included) |
 | 2 | Invalid arguments |
 | 3 | No readable Security, System, Directory Service, NTLM Operational or SMBServer Audit logs in the folder |
-| 4 | Incomplete: cancelled, or some files had read errors |
+| 4 | Nothing found, but the scan is incomplete: cancelled, or some files had read errors. Findings in an incomplete scan still return 1, with a warning. |
 | 5 | An export file could not be written |
 
 Example:
