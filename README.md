@@ -9,7 +9,7 @@ Legacy Auth Finder finds **NTLMv1, RC4, DES, SMBv1, unsigned LDAP and any NTLM u
 ![Legacy Auth Finder, ranked list of what to fix](docs/screenshot-fix-light.png)
 
 <details>
-<summary>Who uses it, dark theme, event list and file list</summary>
+<summary>More screenshots (click to open): who still uses legacy authentication, the dark theme, the event list and the file list</summary>
 
 ![Who still uses legacy authentication](docs/screenshot-summary-light.png)
 
@@ -17,7 +17,7 @@ Legacy Auth Finder finds **NTLMv1, RC4, DES, SMBv1, unsigned LDAP and any NTLM u
 
 ![Event list with details](docs/screenshot-events-light.png)
 
-![File list with the detected log of each file](docs/screenshot-files-light.png)
+![File list with the detected log of each file, events per day and how much history a log of each size would hold](docs/screenshot-files-light.png)
 </details>
 
 The screenshots show the built-in demo data for a made-up domain.
