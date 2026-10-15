@@ -44,14 +44,15 @@
 
     <Grid Margin="16">
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="270" />
+            <ColumnDefinition Width="284" />
             <ColumnDefinition Width="*" />
             <ColumnDefinition Width="380" />
         </Grid.ColumnDefinitions>
 
         <!-- Left: folder, progress, totals -->
         <ScrollViewer Grid.Column="0" Margin="0,0,16,0" VerticalScrollBarVisibility="Auto">
-            <StackPanel>
+            <!-- The Fluent scroll bar is drawn over the content, so the content keeps clear of it on the right. -->
+            <StackPanel Margin="0,0,14,0">
                 <TextBlock Text="Legacy Auth Finder" FontSize="22" FontWeight="SemiBold" />
                 <TextBlock Text="NTLM, NTLMv1, RC4, DES, SMBv1 and unsigned LDAP in archived Windows event logs" Opacity="0.7" TextWrapping="Wrap" Margin="0,4,0,2" />
                 <TextBlock Text="{Binding VersionText, Mode=OneTime}" FontSize="12" Opacity="0.55" Margin="0,0,0,14" />
@@ -126,6 +127,15 @@
                     <Button Content="HTML report (all)" Click="ExportHtml_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,6" />
                     <Button Content="JSON (all)" Click="ExportJson_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,12" />
                 </StackPanel>
+
+                <TextBlock Text="Logging check" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12" Margin="0,0,0,6"
+                           Text="Is everything the scan needs logged? Copy a read-only PowerShell check and paste it into PowerShell (Run as administrator) on each server and domain controller. Windows Server 2016 or newer, it changes nothing." />
+                <Button Content="Copy _logging check (PowerShell)" Click="CopyLoggingCheck_Click" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,4"
+                        ToolTip="Shows on the server which audit policies, logs and settings are on, and how to turn on the missing ones." />
+                <TextBlock Text="{Binding CopyStatus}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,12"
+                           Visibility="{Binding HasCopyStatus, Converter={StaticResource BoolToVis}}" />
+                <Border Height="8" Visibility="{Binding HasCopyStatus, Converter={StaticResource BoolToVisInverted}}" />
 
                 <Button Content="Try the demo data" Click="Demo_Click" IsEnabled="{Binding CanAct}" HorizontalAlignment="Stretch" Padding="8,7" Margin="0,0,0,12" />
 
@@ -251,7 +261,7 @@
                 <TextBlock Text="Pick a row to see the details and what to do about it." Opacity="0.6" TextWrapping="Wrap"
                            Visibility="{Binding HasSelection, Converter={StaticResource BoolToVisInverted}}" />
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Visibility="{Binding HasSelection, Converter={StaticResource BoolToVis}}">
-                    <StackPanel>
+                    <StackPanel Margin="0,0,14,0">
                         <Border CornerRadius="10" Padding="10,2" HorizontalAlignment="Left" Margin="0,0,0,8"
                                 Background="{Binding DetailKind, Converter={StaticResource KindBrush}}">
                             <TextBlock Text="{Binding Guide.Label}" Foreground="White" FontWeight="SemiBold" />

@@ -216,6 +216,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string Notice { get => _notice; private set { _notice = value; OnChanged(); OnChanged(nameof(HasNotice)); } }
     public bool HasNotice => _notice.Length > 0;
 
+    private string _copyStatus = "";
+
+    /// <summary>What happened to the last "Copy logging check": copied, or why not.</summary>
+    public string CopyStatus { get => _copyStatus; set { _copyStatus = value; OnChanged(); OnChanged(nameof(HasCopyStatus)); } }
+    public bool HasCopyStatus => _copyStatus.Length > 0;
+
     public string VersionText => $"Version {Reports.Version}";
     public string WindowTitle => $"Legacy Auth Finder {Reports.Version}";
     public double OverallProgress { get => _overall; private set { _overall = value; OnChanged(); } }

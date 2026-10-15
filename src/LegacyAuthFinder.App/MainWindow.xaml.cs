@@ -101,6 +101,32 @@ public partial class MainWindow : Window
 
     private void ClearEventFilter_Click(object sender, RoutedEventArgs e) => Vm.ClearEventFilter();
 
+    /// <summary>
+    /// Copies the read-only logging check. Another program can hold the clipboard for a moment, so it tries a few
+    /// times and says so when it cannot.
+    /// </summary>
+    private async void CopyLoggingCheck_Click(object sender, RoutedEventArgs e)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Clipboard.SetDataObject(LoggingCheck.Script, copy: true);
+                Vm.CopyStatus = "Copied. Paste it into PowerShell (Run as administrator) on the server and press Enter.";
+                return;
+            }
+            catch (System.Runtime.InteropServices.COMException) when (attempt < 5)
+            {
+                await Task.Delay(100);
+            }
+            catch (System.Runtime.InteropServices.COMException)
+            {
+                Vm.CopyStatus = "The clipboard is in use by another program. Try again.";
+                return;
+            }
+        }
+    }
+
     /// <summary>The rows of a list in the order the grid shows them, after the user sorted a column.</summary>
     private static List<T> Shown<T>(DataGrid grid, IEnumerable<T> fallback) =>
         grid.ItemsSource is null ? [.. fallback] : [.. System.Windows.Data.CollectionViewSource.GetDefaultView(grid.ItemsSource).Cast<T>()];

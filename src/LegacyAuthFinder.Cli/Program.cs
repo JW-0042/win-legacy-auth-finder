@@ -49,12 +49,17 @@ for (var i = 0; i < args.Length; i++)
         case "--html" when i + 1 < args.Length: htmlPath = args[++i]; break;
         case "--quiet": quiet = true; break;
         case "--demo": demo = true; break;
+        case "--logging-check":
+            // The read-only PowerShell check for the servers, for example: legacy-auth-scan --logging-check > check.ps1
+            Console.Write(LoggingCheck.Script);
+            return 0;
         case "-h" or "--help" or "/?":
             Console.WriteLine($"Legacy Auth Finder {Reports.Version}: finds NTLM, NTLMv1, RC4, DES, SMBv1, unsigned LDAP, accounts without Kerberos pre-authentication "
                 + "and Kerberos encryption type errors in archived Windows event logs (.evtx).");
             Console.WriteLine(Usage);
             Console.WriteLine("Every .evtx file in the folder is checked. Security, System, Directory Service, NTLM Operational and SMBServer Audit logs are scanned, other logs are skipped.");
             Console.WriteLine($"A diagnostic log (timings, no event content) is written to {DiagLog.DefaultFolder} unless --no-log is given.");
+            Console.WriteLine("--logging-check prints a read-only PowerShell script that shows on a server whether everything the scan needs is logged.");
             Console.WriteLine("Exit codes: 0 nothing found, 1 legacy authentication found, 2 invalid arguments, 3 no readable log files,");
             Console.WriteLine("            4 nothing found but incomplete (cancelled, or files with read errors), 5 an export could not be written.");
             return 0;

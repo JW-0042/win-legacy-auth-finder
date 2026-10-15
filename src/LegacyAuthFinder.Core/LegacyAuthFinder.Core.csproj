@@ -8,4 +8,8 @@
     <InternalsVisibleTo Include="LegacyAuthFinder.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="LoggingCheck.ps1" LogicalName="LegacyAuthFinder.Core.LoggingCheck.ps1" />
+  </ItemGroup>
+
 </Project>

@@ -104,6 +104,12 @@ The agent that checked the advice against Microsoft's documentation found the wo
 
 One parser question needed an experiment instead of a guess. A crafted file showed that Windows does not always split string arrays into separate values, although real logs said it does. Dumping real classic events showed why: their values sit in a nested template, and only there does Windows split them.
 
+## Version 0.5: checking the logging before the scan
+
+Most empty results are not clean networks but missing audit settings. So the app got a button that copies a PowerShell check to paste on each server. The hard requirement was "production safe": it must only read, and run on Windows Server 2016 with what is there by default.
+
+That shaped the script more than the checks did. Audit policy text is translated on non-English Windows, so it reads the numeric values of `auditpol /backup`. Locked-down servers run PowerShell in Constrained Language Mode, which rejects `[pscustomobject]` and `[math]`, so a test runs the script in that mode. A paste into the old console host needs a trailing empty line, and a tab would trigger tab completion. A test reads the script with the PowerShell parser and fails if it calls anything outside a list of read-only commands. Where Microsoft does not document a setting (the registry value behind "NTLM Enhanced Logging"), the script checks what it can prove instead: whether this Windows build has the events and whether the log is on.
+
 ## Quality gates
 
 - The build treats warnings as errors.

@@ -51,7 +51,7 @@ Legacy Auth Finder does all of that in one pass and gives you that list.
 
 Newer domain controllers also log `ClientAdvertizedEncryptionTypes`, `ServiceAvailableKeys` and related fields in 4768 and 4769. The tool shows them in the detail pane. They tell you whether the client or the service account is the reason RC4 was used.
 
-**Auditing must be on.**
+**Auditing must be on.** "Copy logging check" in the app copies a PowerShell check for that, `legacy-auth-scan --logging-check` prints it. Paste it into PowerShell (Run as administrator) on each server and domain controller. It shows what is logged, what is missing and how to turn it on. It only reads: audit policy, registry values and event log settings, nothing is changed. It runs on Windows Server 2016 and newer with the built-in Windows PowerShell 5.1, also on locked-down servers in Constrained Language Mode, and needs nothing installed. The details:
 - NTLMv1 shows up only when "Audit Logon" success is enabled on the server.
 - RC4, DES, missing pre-authentication and the `0xE` failures show up only when "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" are enabled on the domain controllers (failure auditing for the `0xE` events). Status `0xE` in event 4769 is logged only when `KdcExtraLogLevel` includes `0x10`.
 - Event 4776 needs "Audit Credential Validation" on the domain controllers.
@@ -105,10 +105,11 @@ No admin rights are needed to read copied `.evtx` files. GitHub Actions builds e
 ## Command line
 
 ```
+legacy-auth-scan --logging-check > check.ps1
 legacy-auth-scan <folder> [--no-recurse] [--threads <1-64>] [--events-csv <file>] [--summary-csv <file>] [--fix-csv <file>] [--json <file>] [--html <file>] [--csv-separator <, ; | tab>] [--log <file> | --no-log] [--windows-api] [--quiet]
 ```
 
-The command line writes the same diagnostic log as the app, to the default folder or to `--log <file>`. Output paths are checked before the scan starts, also whether an existing file is read-only or still open in Excel, so a typo does not cost you a long scan. `--csv-separator` takes `,`, `;`, `|` or `tab`. Ctrl+C during the scan stops it and reports what was found so far.
+`--logging-check` prints the read-only PowerShell check described under "Auditing must be on". The command line writes the same diagnostic log as the app, to the default folder or to `--log <file>`. Output paths are checked before the scan starts, also whether an existing file is read-only or still open in Excel, so a typo does not cost you a long scan. `--csv-separator` takes `,`, `;`, `|` or `tab`. Ctrl+C during the scan stops it and reports what was found so far.
 
 | Exit code | Meaning |
 |---|---|
