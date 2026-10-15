@@ -82,9 +82,11 @@ public sealed class LoggingCheckTests(ITestOutputHelper output) : IDisposable
             "auditpol.exe", "whoami.exe", "Get-ItemProperty", "Get-WinEvent", "Get-CimInstance", "Get-SmbServerConfiguration", "Test-Path", "Get-Date",
             // The temp file of auditpol /backup, and the output.
             "Join-Path", "Import-Csv", "ConvertFrom-Csv", "Remove-Item", "Write-Host", "Set-StrictMode",
-            "Where-Object", "Select-Object",
+            "Where-Object", "Select-Object", "Sort-Object", "Measure-Object",
+            // The archive files of AutoBackup logs: list them, never touch them.
+            "Get-ChildItem", "Split-Path",
             // The script's own helpers, the outer & { } and Check running the script block of one check.
-            "Row", "Check", "Reg", "Value", "HasEvent", "Audit", "Log", "inline script block", "$Body",
+            "Row", "Check", "Reg", "Value", "Size", "Days", "HasEvent", "Audit", "Log", "inline script block", "$Body",
         ];
         var commands = text.Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("command=")).Select(l => l["command=".Length..]).ToList();
         Assert.NotEmpty(commands);

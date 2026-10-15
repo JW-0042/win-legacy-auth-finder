@@ -30,6 +30,24 @@ public sealed class FileRow(LogFileInfo info, string root) : INotifyPropertyChan
     public string RecordsText => Info.RecordCount > 0 ? Info.RecordCount.ToString("N0") : "";
     public string RangeText => Info.First is { } f && Info.Last is { } l ? $"{f:yyyy-MM-dd HH:mm} to {l:yyyy-MM-dd HH:mm}" : "";
 
+    /// <summary>"2026-10-01 to 10-14", the full times are in the tool tip.</summary>
+    public string RangeShortText => Info.First is { } f && Info.Last is { } l
+        ? f.Year == l.Year ? $"{f:yyyy-MM-dd} to {l:MM-dd}" : $"{f:yyyy-MM-dd} to {l:yyyy-MM-dd}"
+        : "";
+
+    private readonly RetentionEstimate? _retention = Retention.For(info);
+
+    /// <summary>Events per day in this file, for sorting.</summary>
+    public double EventsPerDay => _retention?.EventsPerDay ?? 0;
+    public string EventsPerDayText => _retention?.EventsPerDayText ?? "";
+
+    /// <summary>Days a log of 32 MB, 100 MB, 250 MB and 1 GB would hold at the load this file shows.</summary>
+    public string RetentionText => _retention?.DaysText ?? "";
+    public string RetentionTip => _retention is { } r
+        ? $"{r.Events:N0} events in {Retention.DaysText(r.CoveredDays)}. At this load a log of {Retention.SizesText} holds {r.DaysText.Replace("about ", "")}."
+          + (r.Rough ? " The file covers less than a day, so this is a rough estimate." : "")
+        : "Not enough events or time in this file for an estimate.";
+
     public FileState State { get => _state; private set { _state = value; OnChanged(); OnChanged(nameof(IsScanning)); } }
     public bool IsScanning => _state == FileState.Scanning;
     public string Status { get => _status; private set { _status = value; OnChanged(); OnChanged(nameof(StatusText)); } }
@@ -308,14 +326,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
         set
         {
             _selection = value;
-            foreach (var n in new[] { nameof(Selection), nameof(HasSelection), nameof(DetailTitle), nameof(DetailRows), nameof(Guide), nameof(DetailKind), nameof(CanShowEvents), nameof(FixAction), nameof(HasFixAction) })
+            foreach (var n in new[] { nameof(Selection), nameof(HasSelection), nameof(DetailTitle), nameof(DetailRows), nameof(Guide), nameof(HasGuide), nameof(DetailKind), nameof(CanShowEvents), nameof(FixAction), nameof(HasFixAction), nameof(FileNote), nameof(HasFileNote) })
             {
                 OnChanged(n);
             }
         }
     }
 
-    public bool HasSelection => _selection is AuthEvent or SummaryRow or FixItem;
+    public bool HasSelection => _selection is AuthEvent or SummaryRow or FixItem or FileRow;
+    public bool HasGuide => Guide is not null;
+
+    /// <summary>For a selected file: what the retention estimate means.</summary>
+    public string FileNote => _selection is FileRow
+        ? "Log of 32 MB to 1 GB: how much history a log of that size holds at the load this file shows. It tells how busy the server is: "
+          + "the busier, the bigger its log must be, or the more often it must be archived. An estimate from the time this file covers."
+        : "";
+    public bool HasFileNote => FileNote.Length > 0;
     public bool CanShowEvents => _selection is SummaryRow or FixItem;
     public LegacyKind? DetailKind => _selection switch { AuthEvent e => e.Kind, SummaryRow s => s.Kind, FixItem f => f.Kind, _ => null };
     public string FixAction => _selection is FixItem f ? f.Action : "";
@@ -327,6 +353,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AuthEvent e => $"{e.KindLabel} · {e.What}",
         SummaryRow s => $"{s.KindLabel} · {s.Count:N0} events",
         FixItem f => $"{f.Rank}. {f.Problem}",
+        FileRow r => Path.GetFileName(r.Info.Path),
         _ => "",
     };
 
@@ -347,8 +374,20 @@ public sealed class MainViewModel : INotifyPropertyChanged
             ("Fix on", f.TargetTypeText), ("Target", f.Target), ("Events", f.Events.ToString("N0")),
             ("First seen", f.FirstSeen.ToString("yyyy-MM-dd HH:mm")), ("Last seen", f.LastSeen.ToString("yyyy-MM-dd HH:mm")),
             ("Accounts", f.AccountsText), ("Clients", f.ClientsText), ("Services", f.ServicesText), ("Logged on", f.ComputersText)).ToList(),
+        FileRow r => FileRows(r),
         _ => [],
     };
+
+    private static List<DetailRow> FileRows(FileRow r)
+    {
+        var e = Retention.For(r.Info);
+        var rows = Rows(("File", r.Info.Path), ("Log", r.Info.Channel), ("Computer", r.Info.Computer), ("Size", r.SizeText), ("Covers", r.RangeText),
+            ("Events", r.Info.RecordCount > 0 ? r.Info.RecordCount.ToString("N0") : ""),
+            ("Time covered", e is null ? "" : Retention.DaysText(e.CoveredDays)), ("Events per day", e?.EventsPerDayText ?? ""), ("Result", r.Status)).ToList();
+        if (e is null) rows.Add(new DetailRow("Estimate", "Not enough events or time in this file."));
+        else rows.AddRange(e.At.Select(a => new DetailRow($"Log of {Reports.SizeText(a.Size).Replace(".0 ", " ")}", (e.Rough ? "about " : "") + Retention.DaysText(a.Days))));
+        return rows;
+    }
 
     private static IEnumerable<DetailRow> Rows(params (string Label, string Value)[] rows) =>
         rows.Where(r => r.Value.Length > 0).Select(r => new DetailRow(r.Label, r.Value));

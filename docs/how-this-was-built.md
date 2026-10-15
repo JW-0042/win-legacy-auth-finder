@@ -110,6 +110,10 @@ Most empty results are not clean networks but missing audit settings. So the app
 
 That shaped the script more than the checks did. Audit policy text is translated on non-English Windows, so it reads the numeric values of `auditpol /backup`. Locked-down servers run PowerShell in Constrained Language Mode, which rejects `[pscustomobject]` and `[math]`, so a test runs the script in that mode. A paste into the old console host needs a trailing empty line, and a tab would trigger tab completion. A test reads the script with the PowerShell parser and fails if it calls anything outside a list of read-only commands. Where Microsoft does not document a setting (the registry value behind "NTLM Enhanced Logging"), the script checks what it can prove instead: whether this Windows build has the events and whether the log is on.
 
+## Version 0.5.1: real servers answer back
+
+The first real runs of the logging check came from two domain controllers, Server 2016 and 2022. Everything read correctly, but one line gave wrong advice: on Server 2016 it suggested an update for the new NTLM events, which Microsoft never ships for 2016. That line now explains that the older Restrict NTLM audit covers it there. The same output showed a 4 GB Security log holding less than a day on the 2022 domain controller, which led to two features: the check now lists the archive files of AutoBackup logs, and the app estimates for every file how much history a log of 32 MB, 100 MB, 250 MB or 1 GB would hold at that load. The HTML report got the events behind every fix, so it explains itself without the app.
+
 ## Quality gates
 
 - The build treats warnings as errors.

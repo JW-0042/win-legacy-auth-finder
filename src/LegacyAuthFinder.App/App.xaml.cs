@@ -134,6 +134,10 @@ public partial class App : Application
         else if (tab == "files")
         {
             vm.SelectedTab = 3;
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            // A busy domain controller log, so the image shows the retention estimate.
+            var grid = (System.Windows.Controls.DataGrid)window.FindName("FilesGrid");
+            grid.SelectedItem = vm.Files.Where(f => f.EventsPerDay > 0).OrderByDescending(f => f.EventsPerDay).FirstOrDefault();
         }
         else if (tab == "fix")
         {

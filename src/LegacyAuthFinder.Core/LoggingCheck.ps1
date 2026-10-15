@@ -25,6 +25,10 @@
 
     function Value($v) { if ($null -eq $v) { 'not set' } else { 'value ' + $v } }
 
+    function Size($bytes) { if ($bytes -ge 1GB) { '{0:0.0} GB' -f ($bytes / 1GB) } else { '{0:0} MB' -f ($bytes / 1MB) } }
+
+    function Days($n) { if ($n -eq 1) { '1 day' } else { [string]$n + ' days' } }
+
     function HasEvent([string]$Provider, [int]$Id) {
         try {
             $meta = Get-WinEvent -ListProvider $Provider -ErrorAction Stop
@@ -35,6 +39,8 @@
     $os = Get-CimInstance -ClassName Win32_OperatingSystem
     $cs = Get-CimInstance -ClassName Win32_ComputerSystem
     $isDc = $cs.DomainRole -ge 4
+    # Windows Server 2016 is build 14393. Microsoft adds the enhanced NTLM events to 2019 (17763) and newer only.
+    $is2016 = [int]$os.BuildNumber -lt 17763
     # Native tools run with Continue: in Windows PowerShell 5.1 any text on stderr would otherwise stop the script.
     $elevated = $false
     try {
@@ -108,8 +114,38 @@
         try {
             $oldest = Get-WinEvent -LogName $Name -MaxEvents 1 -Oldest -ErrorAction Stop
             $days = ((Get-Date) - $oldest.TimeCreated).Days
-            $current += ', oldest event ' + $oldest.TimeCreated.ToString('yyyy-MM-dd') + ' (' + $days + ' days)'
+            $current += ', oldest event ' + $oldest.TimeCreated.ToString('yyyy-MM-dd') + ' (' + (Days $days) + ')'
         } catch { }
+
+        # AutoBackup: a full log is saved as Archive-<log>-<time>.evtx next to it and a new one starts. The archives
+        # hold the history, and Windows never deletes them, so the free space of that disk matters.
+        if ([string]$log.LogMode -eq 'AutoBackup') {
+            try {
+                $path = ([string]$log.LogFilePath) -replace '%SystemRoot%', $env:SystemRoot -replace '%windir%', $env:windir
+                $folder = Split-Path -Path $path -Parent
+                $base = (Split-Path -Path $path -Leaf) -replace '\.evtx$', ''
+                $archives = @(Get-ChildItem -LiteralPath $folder -Filter ('Archive-' + $base + '-*.evtx') -File -ErrorAction Stop)
+                if ($archives.Count -gt 0) {
+                    $total = ($archives | Measure-Object -Property Length -Sum).Sum
+                    $first = ($archives | Sort-Object -Property LastWriteTime | Select-Object -First 1).LastWriteTime
+                    $current += ', ' + $archives.Count + ' archive files next to it (' + (Size $total) + ' since ' + $first.ToString('yyyy-MM-dd') + ')'
+                    $hours = ((Get-Date) - $first).TotalHours
+                    if ($archives.Count -ge 2 -and $hours -gt 0) { $current += ', a new one about every ' + ('{0:0.#}' -f ($hours / $archives.Count)) + ' h' }
+                } else {
+                    $current += ', no archive files yet'
+                }
+                $drive = Split-Path -Path $folder -Qualifier
+                $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='" + $drive + "'")
+                if ($disk -and $disk.Size -gt 0) {
+                    $freeShare = $disk.FreeSpace / $disk.Size
+                    $current += ', disk ' + $drive + ' ' + ('{0:0}' -f ($freeShare * 100)) + '% free'
+                    if ($freeShare -lt 0.1) {
+                        return Row 'WARN' $Area ('Log ' + $Name) $current ($Why + ' Windows never deletes the archive files of an AutoBackup log, and the disk is almost full: copy the archives away for the scan and remove the old ones.') ''
+                    }
+                }
+            } catch { }
+        }
+
         $full = $log.FileSize -ge 0.9 * $log.MaximumSizeInBytes
         if ($full -and $log.LogMode -eq 'Circular' -and $null -ne $days -and $days -lt 7) {
             $bigger = $log.MaximumSizeInBytes * 4
@@ -129,9 +165,15 @@
     }
 
     $ntlmEnhanced = HasEvent 'Microsoft-Windows-NTLM' 4020
+    $msv = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
+    $restrictOn = ((Reg $msv 'AuditReceivingNTLMTraffic') -eq 2) -and ((Reg $msv 'RestrictSendingNTLMTraffic') -in 1, 2)
     $rows += Check 'NTLM' 'Enhanced NTLM events' {
         if ($ntlmEnhanced) {
             Row 'OK' 'NTLM' 'Enhanced NTLM events 4020 to 4023' 'available on this build' 'They name every NTLM sign-in with the reason. On by default, unless Group Policy turns off "NTLM Enhanced Logging" (Administrative Templates > System > NTLM): check with gpresult /h.'
+        } elseif ($is2016 -and $restrictOn) {
+            Row 'INFO' 'NTLM' 'Enhanced NTLM events 4020 to 4023' 'not available on Windows Server 2016' 'Microsoft adds them to Windows Server 2019 and newer only. Here the Restrict NTLM audit below records NTLM use (events 8001 to 8003), and that is on.'
+        } elseif ($is2016) {
+            Row 'WARN' 'NTLM' 'Enhanced NTLM events 4020 to 4023' 'not available on Windows Server 2016' 'Microsoft adds them to Windows Server 2019 and newer only. On this server the Restrict NTLM audit below is the only record of NTLM use: turn it on.'
         } else {
             Row 'WARN' 'NTLM' 'Enhanced NTLM events 4020 to 4023' ('not available on build ' + $os.BuildNumber) 'Windows Server 2019 and 2022 get them with the October 2026 updates, Windows Server 2025 has them. On Server 2016 use the Restrict NTLM audit settings below.' 'Install the latest cumulative update.'
         }
@@ -206,12 +248,33 @@
         }
         $rows += Check 'Kerberos' 'DefaultDomainSupportedEncTypes' {
             $v = Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc' 'DefaultDomainSupportedEncTypes'
-            $current = if ($null -eq $v) { 'not set (Windows default)' } else { '0x{0:x}' -f [int]$v }
-            Row 'INFO' 'Kerberos' 'DefaultDomainSupportedEncTypes' $current 'Encryption types the domain controller assumes for accounts without msDS-SupportedEncryptionTypes. Event 205 is logged while it allows more than AES.'
+            if ($null -eq $v) {
+                $current = 'not set (Windows default: AES only since the April 2026 updates)'
+            } else {
+                # The bits of msDS-SupportedEncryptionTypes.
+                $types = @()
+                if ([int]$v -band 0x1) { $types += 'DES-CBC-CRC' }
+                if ([int]$v -band 0x2) { $types += 'DES-CBC-MD5' }
+                if ([int]$v -band 0x4) { $types += 'RC4' }
+                if ([int]$v -band 0x8) { $types += 'AES128' }
+                if ([int]$v -band 0x10) { $types += 'AES256' }
+                if ([int]$v -band 0x20) { $types += 'AES session keys' }
+                $verdict = if (([int]$v -band 0x4) -and ([int]$v -band 0x3)) { 'allows RC4 and DES' }
+                    elseif ([int]$v -band 0x4) { 'allows RC4' }
+                    elseif ([int]$v -band 0x3) { 'allows DES' }
+                    else { 'AES only' }
+                $current = ('0x{0:x}' -f [int]$v) + ' = ' + ($types -join ', ') + ': ' + $verdict
+            }
+            Row 'INFO' 'Kerberos' 'DefaultDomainSupportedEncTypes' $current 'Encryption types the domain controller assumes for accounts without msDS-SupportedEncryptionTypes. Event 205 is logged while it allows more than AES. Keep it the same on every domain controller, or the same account gets other encryption depending on which one answers.'
         }
         $rows += Check 'Netlogon' 'Enhanced domain NTLM events' {
+            $domainAudit = (Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'AuditNTLMInDomain') -eq 7
             if (HasEvent 'Microsoft-Windows-Security-Netlogon' 4030) {
                 Row 'OK' 'NTLM' 'Domain controller NTLM events 4030 to 4033' 'available on this build' 'On by default, unless Group Policy turns off "Log Enhanced Domain-wide NTLM Logs" (Administrative Templates > System > Netlogon).'
+            } elseif ($is2016 -and $domainAudit) {
+                Row 'INFO' 'NTLM' 'Domain controller NTLM events 4030 to 4033' 'not available on Windows Server 2016' 'Microsoft adds them to Windows Server 2019 and newer only. Here the audit of NTLM in this domain below (event 8004) and event 4776 record NTLM use, and that is on.'
+            } elseif ($is2016) {
+                Row 'WARN' 'NTLM' 'Domain controller NTLM events 4030 to 4033' 'not available on Windows Server 2016' 'Microsoft adds them to Windows Server 2019 and newer only. On this domain controller turn on the audit of NTLM in this domain below (event 8004), next to event 4776.'
             } else {
                 Row 'WARN' 'NTLM' 'Domain controller NTLM events 4030 to 4033' ('not available on build ' + $os.BuildNumber) 'Server 2019 and 2022 get them with the October 2026 updates. Without them, use Audit NTLM authentication in this domain below and event 4776.' 'Install the latest cumulative update.'
             }
